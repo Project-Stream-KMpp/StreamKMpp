@@ -80,7 +80,7 @@ final class BucketManager(val m: Int, val seed: Long) extends Serializable {
             buckets(level) ++= reduced
             placed = true
           } else {
-            union = reduced ++ buckets(level).toArray
+            union = reduced ++ buckets(level)
             buckets(level).clear()
             level += 1
           }

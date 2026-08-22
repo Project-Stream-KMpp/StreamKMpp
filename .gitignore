@@ -1,0 +1,29 @@
+# sbt
+target/
+project/target/
+project/project/
+*.class
+*.log
+
+# Metals / Bloop / BSP
+.metals/
+.bloop/
+.bsp/
+metals.sbt
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# sbt-launcher / ivy cache leftovers occasionnellement locaux au repo
+.history
+.cache

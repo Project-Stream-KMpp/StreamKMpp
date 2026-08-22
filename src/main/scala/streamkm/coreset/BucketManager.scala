@@ -123,20 +123,31 @@ final class BucketManager(val m: Int, val seed: Long) extends Serializable {
   def extractCoreset(): Array[Point] = CoresetTree.build(union(), m, rng)
 
   /**
-   * Fusion de deux structures indépendantes, pour le `combOp` d'un `treeAggregate`.
+   * Fusion de deux structures indépendantes, pour le `combOp` d'un `treeAggregate`/
+   * `treeReduce`.
    *
    * Repose sur les deux observations du §2.3.4 :
    *   1. l'union de deux ε-coresets d'ensembles disjoints est un ε-coreset de l'union ;
    *   2. un ε-coreset d'un δ-coreset est un (ε + δ + εδ)-coreset.
    * La seconde explique que l'erreur s'accumule à chaque niveau de fusion — c'est
-   * précisément pourquoi on utilise `treeAggregate` avec une profondeur limitée (2 par
-   * défaut) plutôt qu'une réduction linéaire : la profondeur de l'arbre de fusion borne
-   * le nombre d'empilements. À discuter dans le rapport.
+   * précisément pourquoi `streamkm.spark.StreamKMPlusPlus.mergeCoresets` utilise un
+   * `treeReduce` de profondeur bornée plutôt qu'une réduction linéaire : la profondeur de
+   * l'arbre de fusion borne le nombre d'empilements. Voir CLAUDE.md, décision 11,
+   * pour le calcul explicite de cette borne.
+   *
+   * La réduction `CoresetTree.build(all, m, out.rng)` utilise le générateur de `out` —
+   * celui construit avec la graine combinée `seed ^ other.seed` — et NON celui de `this`
+   * ni celui de `other`. C'est important : à chaque niveau d'un `treeReduce`, ce générateur
+   * combine la graine des DEUX opérandes de ce niveau précis, garantissant un aléa
+   * réellement indépendant à chaque étage de l'arbre de fusion, pas seulement au premier
+   * niveau (partition → coreset partiel). Utiliser `this.rng` ou `other.rng` à la place
+   * ferait dépendre l'aléa de CE niveau uniquement de l'un des deux opérandes, en ignorant
+   * l'autre — un bug identifié et corrigé le 2026-08-22 (CLAUDE.md, décision 10).
    *
    * Le résultat est « collapsé » : son état n'est plus un empilement de buckets valide
    * au sens des invariants, mais un unique coreset de taille m. Toute insertion ultérieure
-   * est refusée. C'est sans conséquence pour `treeAggregate`, dont le `combOp` ne reçoit
-   * jamais que des résultats de `seqOp` ou de `combOp`, jamais de points bruts.
+   * est refusée. C'est sans conséquence pour `treeAggregate`/`treeReduce`, dont le `combOp`
+   * ne reçoit jamais que des résultats de `seqOp`/`combOp`, jamais de points bruts.
    *
    * Ne modifie ni `this` ni `other`.
    */
@@ -148,7 +159,7 @@ final class BucketManager(val m: Int, val seed: Long) extends Serializable {
 
     out.buckets(0).clear()
     out.ensureLevel(1)
-    out.buckets(1) ++= CoresetTree.build(all, m, rng)
+    out.buckets(1) ++= CoresetTree.build(all, m, out.rng)
     out.seen      = seen + other.seen
     out.collapsed = true
     out

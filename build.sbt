@@ -4,11 +4,18 @@ ThisBuild / scalaVersion := "2.12.18"
 ThisBuild / organization := "streamkm"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
 
+// Spark 3.5.x : dernière branche 3.5 supportant nativement Java 17 (E4).
+// Scope "provided" : disponible en compile/test, absent du jar assemblé — c'est
+// spark-submit qui fournit ces classes au runtime en production.
+val sparkVersion = "3.5.3"
+
 lazy val root = (project in file("."))
   .settings(
     name := "streamkm-spark",
     libraryDependencies ++= Seq(
-      "org.scalatest" %% "scalatest" % "3.2.18" % Test
+      "org.scalatest"    %% "scalatest"  % "3.2.18"     % Test,
+      "org.apache.spark" %% "spark-core" % sparkVersion % Provided,
+      "org.apache.spark" %% "spark-sql"  % sparkVersion % Provided
     ),
     scalacOptions ++= Seq(
       "-deprecation",
@@ -19,13 +26,30 @@ lazy val root = (project in file("."))
     // -ea active les `assert` d'invariants du BucketManager pendant les tests.
     // En production (E4) on laisse -ea désactivé : les assertions coûtent cher
     // dans les boucles chaudes.
+    //
+    // Les --add-opens sont indispensables pour faire tourner Spark sous Java 17 :
+    // Spark/Hadoop utilisent de la réflexion sur des modules internes du JDK
+    // (java.lang, java.nio, sun.nio.ch...) que le module system de Java 17 bloque
+    // par défaut (InaccessibleObjectException sans ce flag). Ce n'est PAS une
+    // fantaisie de config : sans ça, `sbt test` plante dès la création du
+    // SparkContext. Spark lui-même ajoute ces mêmes flags dans ses scripts de
+    // lancement (spark-submit) à partir de la 3.3.
     Test / fork        := true,
-    Test / javaOptions ++= Seq("-Xmx2g", "-ea")
+    Test / javaOptions ++= Seq(
+      "-Xmx2g",
+      "-ea",
+      "--add-opens=java.base/java.lang=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+      "--add-opens=java.base/java.io=ALL-UNNAMED",
+      "--add-opens=java.base/java.net=ALL-UNNAMED",
+      "--add-opens=java.base/java.nio=ALL-UNNAMED",
+      "--add-opens=java.base/java.util=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",
+      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+      "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",
+      "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
+      "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
+    )
   )
-
-// E4 ajoutera :
-// libraryDependencies ++= Seq(
-//   "org.apache.spark" %% "spark-core"  % "3.5.1" % Provided,
-//   "org.apache.spark" %% "spark-sql"   % "3.5.1" % Provided,
-//   "org.apache.spark" %% "spark-mllib" % "3.5.1" % Provided
-// )

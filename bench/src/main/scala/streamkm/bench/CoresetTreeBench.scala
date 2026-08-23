@@ -1,0 +1,36 @@
+package streamkm.bench
+
+import java.util.concurrent.TimeUnit
+import org.openjdk.jmh.annotations._
+import org.openjdk.jmh.infra.Blackhole
+import scala.util.Random
+import streamkm.core.Point
+import streamkm.coreset.CoresetTree
+
+@State(Scope.Thread)
+@BenchmarkMode(Array(Mode.SampleTime, Mode.Throughput))
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
+@Warmup(iterations = 3, time = 2)
+@Measurement(iterations = 10, time = 3)
+@Fork(1)
+class CoresetTreeBench {
+
+  @Param(Array("5000", "20000"))
+  var n: Int = _
+
+  @Param(Array("500", "2000"))
+  var m: Int = _
+
+  val d: Int = 10
+
+  var points: Array[Point] = _
+
+  @Setup(Level.Trial)
+  def setup(): Unit = {
+    val rng = new Random(42L)
+    points  = Array.fill(n)(Point(Array.fill(d)(rng.nextGaussian())))
+  }
+
+  @Benchmark
+  def build(bh: Blackhole): Unit = bh.consume(CoresetTree.build(points, m, new Random(43L)))
+}

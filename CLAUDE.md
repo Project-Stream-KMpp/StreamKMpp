@@ -215,6 +215,52 @@ attendant la couche `spark`.
     de cette précision signalerait un vrai bug de comptage (points dupliqués ou
     perdus par le partitionnement), pas une variance d'échantillonnage.
 
+### E7 — métriques de qualité sur Covertype (2026-08-25), `streamkm.experiments`
+
+Choix du groupe : Covertype (581 012 × 54, UCI) plutôt que les gaussiennes
+synthétiques pour les expériences de qualité — c'est en haute dimension que
+le coreset est vraiment mis à l'épreuve, et la thèse rapporte des résultats
+dessus (comparaison possible). Fichier brut NON versionné (~72 Mo) :
+`data/covertype/download.sh` le régénère ; `data/small/covtype_10k.data`
+(10 000 lignes, tirage aléatoire seed=42, versionné) sert aux tests et aux
+runs rapides.
+
+15. **`CovertypeLoader.parseLine` rejette la 55ᵉ colonne (`Cover_Type`).**
+    54 colonnes de features numériques (10 mesures continues + 4+40 colonnes
+    one-hot), aucune standardisation appliquée — features brutes, comme le
+    papier d'origine. À documenter comme limite dans le rapport : les colonnes
+    one-hot (échelle 0/1) et les mesures brutes (échelle jusqu'à ~7000) pèsent
+    très différemment dans une distance euclidienne au carré.
+16. **`E2TradeoffM` (trade-off m, fig. 5.1-5.2 thèse) tourne avec une grille
+    réduite par défaut** (3 runs au lieu de 10) : la grille complète de la
+    SPEC (m×k×10 runs = 210 combinaisons) devient coûteuse en `local[*]` dès
+    que m et k sont grands (Lloyd sur un coreset de 20 000 points en
+    dimension 54, 5 redémarrages, jusqu'à 100 itérations). Grille et nombre de
+    runs réglables en CLI (`--m`, `--k`, `--runs`, `--partitions`) — la grille
+    complète est à lancer séparément pour les chiffres définitifs du rapport,
+    sur une machine plus patiente ou un cluster.
+17. **`E6Baseline` évalue StreamKM++, `spark.ml.KMeans` et
+    `mllib.StreamingKMeans` avec LA MÊME fonction de coût** (`CostEvaluator`,
+    jamais le coût interne de chaque bibliothèque, qui peut être défini
+    différemment). `ml.KMeans` reçoit `maxIter=100` pour un effort comparable
+    à `core.KMeans.lloyd`. `StreamingKMeans` (API DStream, dépréciée depuis
+    Spark 3.4 mais sans équivalent Structured Streaming) est nourri via un
+    `StreamingContext.queueStream` qui rejoue le RDD statique par tranches,
+    faute d'un vrai flux.
+    **Résultat observé** (smoke test 10k points, m=1000, k=5) :
+    `StreamingKMeans` a un coût ~4 ordres de grandeur pire que StreamKM++ et
+    `ml.KMeans` (~1e14 contre ~1e10). Cause probable : `setRandomCenters` tire
+    les centres initiaux suivant une loi normale centrée en 0, sans rapport
+    avec l'échelle réelle de Covertype (non standardisée), et le petit nombre
+    de micro-batches ne laisse pas le temps de corriger un mauvais tirage.
+    **Décision : ne pas corriger** (par exemple en standardisant les features)
+    — ce serait avantager `StreamingKMeans` seul et fausser la comparaison à
+    trois. Ce résultat illustre concrètement ce que la SPEC §5 anticipait déjà
+    pour la section « points forts/faibles » : StreamKM++ garantit une
+    propriété de coreset, `StreamingKMeans` non, et y est sensible à
+    l'initialisation. À confirmer sur la grille complète (581 k points) avant
+    de l'écrire dans le rapport — un seul smoke test n'est pas une preuve.
+
 ## État d'avancement
 
 | Étape | Contenu | État |
@@ -225,8 +271,8 @@ attendant la couche `spark`.
 | E3 | Rédaction ch. 3 (rapport) | à faire (le code de la couche Spark existe, pas encore sa description en prose) |
 | E4 | `streamkm.spark`, job borné §4.1 | **fait : `partialCoresets`, `mergeCoresets`, `run` (Structured Streaming), 5 tests dont le test de non-régression distribué/séquentiel** |
 | E5 | Job de mesure du coût (§4.2) | **fait : `CostEvaluator.cost`, 4 tests** — instrument de mesure prêt pour E1/E2/E6 |
-| E6 | Optimisation kernel local (JMH) | à faire |
-| E7 | Expériences ch. 5 | à faire |
+| E6 | Optimisation kernel local (JMH) | **fait sur la branche `feat/benchmark` (non fusionnée)** : `bench/`, résultats dans `results/jmh_results.csv` |
+| E7 | Expériences ch. 5 | **qualité en cours** : `streamkm.experiments` (`CovertypeLoader`, `E2TradeoffM`, `E6Baseline`) sur Covertype, vérifié par smoke test sur l'échantillon 10k — grille complète (581k, 210 combinaisons E2) pas encore lancée. Scalabilité (E3, E3bis, E4, E5) pas commencée. |
 | E8 | Variante à requêtes (§4.3) | à faire, ou décrite si le temps manque |
 | E9 | Notebook + rapport | à faire |
 
@@ -243,8 +289,16 @@ dans la réponse qui accompagne ce commit). Aucun fichier de `streamkm.core` ou
 ## Commandes
 
 ```
-sbt test    # compile + fait tourner les 26 tests (core + coreset + spark)
+sbt test    # compile + fait tourner les tests (core + coreset + spark + experiments)
 sbt run     # streamkm.demo.Main — démonstration E1/E2 sur un mélange gaussien
+
+# E7 (qualité, sur Covertype) : dépendances Provided invisibles pour `sbt run`
+# (cf. note ci-dessous) → passer par Test/runMain.
+data/covertype/download.sh   # une fois, télécharge covtype.data (~72 Mo, non versionné)
+
+sbt "Test/runMain streamkm.experiments.E2TradeoffM --data data/covertype/covtype.data --out results/e2_tradeoff_m.csv"
+sbt "Test/runMain streamkm.experiments.E6Baseline  --data data/covertype/covtype.data --out results/e6_baseline.csv --k 25,50,75"
+# --data data/small/covtype_10k.data pour un smoke test rapide avant de lancer sur les 581k.
 ```
 
 Scala 2.12.18 (imposé par Spark 3.5, cf. `build.sbt`). Dépendances : `scalatest`

@@ -27,3 +27,12 @@ out/
 # sbt-launcher / ivy cache leftovers occasionnellement locaux au repo
 .history
 .cache
+
+# Jeux de données bruts (SPEC §7 : seul data/small/ est versionné).
+# data/covertype/download.sh les re-télécharge à la demande.
+data/covertype/*.data
+data/covertype/*.info
+data/covertype/*.zip
+
+# Sorties d'expériences (E7) : régénérées par les jobs, pas versionnées.
+results/*.csv

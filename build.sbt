@@ -13,9 +13,12 @@ lazy val root = (project in file("."))
   .settings(
     name := "streamkm-spark",
     libraryDependencies ++= Seq(
-      "org.scalatest"    %% "scalatest"  % "3.2.18"     % Test,
-      "org.apache.spark" %% "spark-core" % sparkVersion % Provided,
-      "org.apache.spark" %% "spark-sql"  % sparkVersion % Provided
+      "org.scalatest"    %% "scalatest"   % "3.2.18"     % Test,
+      "org.apache.spark" %% "spark-core"  % sparkVersion % Provided,
+      "org.apache.spark" %% "spark-sql"   % sparkVersion % Provided,
+      // E6 (SPEC §5, table d'expériences) : baseline spark.ml.KMeans + StreamingKMeans
+      // (org.apache.spark.mllib.clustering), toutes deux dans ce module.
+      "org.apache.spark" %% "spark-mllib" % sparkVersion % Provided
     ),
     scalacOptions ++= Seq(
       "-deprecation",

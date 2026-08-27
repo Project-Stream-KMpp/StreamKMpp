@@ -4,7 +4,7 @@ import java.util.concurrent.TimeUnit
 import org.openjdk.jmh.annotations._
 import org.openjdk.jmh.infra.Blackhole
 import scala.util.Random
-import streamkm.core.Point
+import streamkm.core.{Point, PointsSoA}
 import streamkm.coreset.BucketManager
 
 @State(Scope.Thread)
@@ -23,18 +23,25 @@ class InsertBench {
 
   val d: Int = 10
 
-  var points: Array[Point] = _
+  // BucketManager.insertAll LIT le store (copyCoordinatesInto/weight) sans le libérer —
+  // réutilisable tel quel à chaque invocation, contrairement à CoresetTree.build.
+  var points: PointsSoA = _
 
   @Setup(Level.Trial)
   def setup(): Unit = {
     val rng = new Random(42L)
-    points  = Array.fill(n)(Point(Array.fill(d)(rng.nextGaussian())))
+    val raw = Array.fill(n)(Point(Array.fill(d)(rng.nextGaussian())))
+    points  = PointsSoA.fromPoints(raw)
   }
+
+  @TearDown(Level.Trial)
+  def tearDown(): Unit = points.free()
 
   @Benchmark
   def insertAll(bh: Blackhole): Unit = {
-    val bm = new BucketManager(m, seed = 42L)
+    val bm = BucketManager(m, dimension = d, seed = 42L)
     bm.insertAll(points)
     bh.consume(bm)
+    bm.free() // sans quoi chaque invocation fuit les buckets natifs alloués
   }
 }

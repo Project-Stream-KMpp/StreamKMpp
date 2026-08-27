@@ -4,7 +4,7 @@ import java.util.concurrent.TimeUnit
 import org.openjdk.jmh.annotations._
 import org.openjdk.jmh.infra.Blackhole
 import scala.util.Random
-import streamkm.core.Distance
+import streamkm.core.{Distance, PointsSoA}
 
 @State(Scope.Thread)
 @BenchmarkMode(Array(Mode.SampleTime, Mode.Throughput))
@@ -17,16 +17,22 @@ class SqdistBench {
   @Param(Array("2", "10", "50"))
   var d: Int = _
 
-  var a: Array[Double] = _
-  var b: Array[Double] = _
+  var storeA: PointsSoA = _
+  var storeB: PointsSoA = _
 
-  @Setup
+  @Setup(Level.Trial)
   def setup(): Unit = {
     val rng = new Random(42L)
-    a = Array.fill(d)(rng.nextDouble())
-    b = Array.fill(d)(rng.nextDouble())
+    storeA  = PointsSoA.allocate(1, d)
+    storeA.append(Array.fill(d)(rng.nextDouble()), 1.0)
+    storeB  = PointsSoA.allocate(1, d)
+    storeB.append(Array.fill(d)(rng.nextDouble()), 1.0)
   }
 
+  @TearDown(Level.Trial)
+  def tearDown(): Unit = { storeA.free(); storeB.free() }
+
+  // Distance.sqdist ne consomme ni ne modifie ses arguments — un seul store par Trial suffit.
   @Benchmark
-  def sqdist(bh: Blackhole): Unit = bh.consume(Distance.sqdist(a, b))
+  def sqdist(bh: Blackhole): Unit = bh.consume(Distance.squareDistance(storeA, 0, storeB, 0))
 }

@@ -4,7 +4,7 @@ import java.util.concurrent.TimeUnit
 import org.openjdk.jmh.annotations._
 import org.openjdk.jmh.infra.Blackhole
 import scala.util.Random
-import streamkm.core.{KMeans, Point}
+import streamkm.core.{KMeans, Point, PointsSoA}
 
 @State(Scope.Thread)
 @BenchmarkMode(Array(Mode.SampleTime, Mode.Throughput))
@@ -22,16 +22,28 @@ class LloydBench {
 
   val d: Int = 10
 
-  var points: Array[Point]         = _
-  var init:   Array[Array[Double]] = _
+  var points: PointsSoA = _ // stable sur tout le Trial — lloyd ne le libère jamais
+  var init:   PointsSoA = _ // CONSOMMÉ par lloyd — régénéré à CHAQUE invocation
 
-  @Setup(Level.Invocation)
-  def setup(): Unit = {
+  @Setup(Level.Trial)
+  def setupTrial(): Unit = {
     val rng = new Random(42L)
-    points  = Array.fill(n)(Point(Array.fill(d)(rng.nextGaussian())))
-    init    = KMeans.seedPlusPlus(points, k, new Random(43L))
+    val raw = Array.fill(n)(Point(Array.fill(d)(rng.nextGaussian())))
+    points  = PointsSoA.fromPoints(raw)
   }
 
+  @Setup(Level.Invocation)
+  def setupInvocation(): Unit = {
+    init = KMeans.seedPlusPlus(points, k, new Random(43L))
+  }
+
+  @TearDown(Level.Trial)
+  def tearDownTrial(): Unit = points.free()
+
   @Benchmark
-  def lloyd(bh: Blackhole): Unit = bh.consume(KMeans.lloyd(points, init))
+  def lloyd(bh: Blackhole): Unit = {
+    val model = KMeans.lloyd(points, init) // consomme et libère `init`
+    bh.consume(model)
+    model.centers.free()
+  }
 }

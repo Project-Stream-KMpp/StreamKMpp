@@ -4,20 +4,9 @@ import java.util.concurrent.TimeUnit
 import org.openjdk.jmh.annotations._
 import org.openjdk.jmh.infra.Blackhole
 import scala.util.Random
-import streamkm.core.{KMeans, Point}
+import streamkm.core.{KMeans, Point, PointsSoA}
 import streamkm.coreset.BucketManager
 
-/**
- * Benchmark bout-en-bout de la couche kernel (sans Spark) :
- *   BucketManager.insertAll → extractCoreset → KMeans.fit
- *
- * Représente le pipeline séquentiel de référence de la thèse (§5.2.1) et isole
- * le goulot `KMeans.fit` que §5.3.1 identifie comme non-parallélisable.
- *
- * Paramètres intentionnellement restreints (n ≤ 50k) : KMeans.fit avec
- * nRestarts=5 peut prendre plusieurs secondes à grande échelle. Pour les
- * profils à grande échelle, utiliser E7Runner.
- */
 @State(Scope.Thread)
 @BenchmarkMode(Array(Mode.SampleTime, Mode.Throughput))
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
@@ -34,30 +23,39 @@ class PipelineBench {
 
   val d: Int = 10
 
-  var points: Array[Point] = _
-  var m: Int               = _
+  var points: PointsSoA = _
+  var m: Int            = _
 
   @Setup(Level.Trial)
   def setup(): Unit = {
     val rng = new Random(42L)
-    points  = Array.fill(n)(Point(Array.fill(d)(rng.nextGaussian())))
+    val raw = Array.fill(n)(Point(Array.fill(d)(rng.nextGaussian())))
+    points  = PointsSoA.fromPoints(raw)
     m       = BucketManager.recommendedM(k)
   }
 
-  /** Pipeline complet : ingest + coreset + clustering. */
+  @TearDown(Level.Trial)
+  def tearDown(): Unit = points.free()
+
   @Benchmark
   def fullPipeline(bh: Blackhole): Unit = {
-    val bm = new BucketManager(m, seed = 42L)
+    val bm      = BucketManager(m, dimension = d, seed = 42L)
     bm.insertAll(points)
     val coreset = bm.extractCoreset()
-    bh.consume(KMeans.fit(coreset, k, nRestarts = 5, seed = 42L))
+    val model   = KMeans.fit(coreset, k, nRestarts = 5, seed = 42L)
+    coreset.free()
+    bh.consume(model)
+    model.centers.free()
+    bm.free()
   }
 
-  /** Isole BucketManager seul (ingest + coreset) pour quantifier la part de KMeans.fit. */
   @Benchmark
   def ingestOnly(bh: Blackhole): Unit = {
-    val bm = new BucketManager(m, seed = 42L)
+    val bm      = BucketManager(m, dimension = d, seed = 42L)
     bm.insertAll(points)
-    bh.consume(bm.extractCoreset())
+    val coreset = bm.extractCoreset()
+    bh.consume(coreset)
+    coreset.free()
+    bm.free()
   }
 }

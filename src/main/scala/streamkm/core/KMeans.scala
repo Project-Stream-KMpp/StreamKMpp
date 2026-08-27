@@ -4,15 +4,12 @@ import scala.util.Random
 
 /** Résultat d'un clustering : les centres, la SSE pondérée atteinte, le nombre d'itérations. */
 final case class KMeansModel(
-  centers:    Array[Array[Double]],
-  cost:       Double,
-  iterations: Int
-) extends Serializable {
-
-  def k: Int = centers.length
-
-  override def toString: String =
-    s"KMeansModel(k=$k, cost=$cost, iterations=$iterations)"
+                              centers:    PointsSoA,
+                              cost:       Double,
+                              iterations: Int
+                            ) {
+  def k: Int = centers.n
+  override def toString: String = s"KMeansModel(k=$k, cost=$cost, iterations=$iterations)"
 }
 
 /**
@@ -62,31 +59,33 @@ object KMeans {
    *
    * Coût : O(n·k·d).
    */
-  def seedPlusPlus(points: Array[Point], k: Int, rng: Random): Array[Array[Double]] = {
-    require(points.nonEmpty, "seedPlusPlus: ensemble de points vide")
+  def seedPlusPlus(points: PointsSoA, k: Int, rng: Random): PointsSoA = {
+    require(points.n > 0, "seedPlusPlus: ensemble de points vide")
     require(k > 0, s"seedPlusPlus: k doit être > 0 (reçu $k)")
 
-    val n       = points.length
-    val kEff    = math.min(k, n)
-    val centers = new Array[Array[Double]](kEff)
+    val n    = points.n
+    val kEff = math.min(k, n)
+    val centers = PointsSoA.allocate(kEff, points.dimension)
+    val tmp     = new Array[Double](points.dimension)
 
-    centers(0) = points(Sampling.byWeight(n, i => points(i).weight, rng)).coords.clone()
+    val i0 = Sampling.byWeight(n, points.weight, rng)
+    points.copyCoordinatesInto(i0, tmp)
+    centers.append(tmp, points.weight(i0))
 
     // closest(i) = distance au carré de points(i) au plus proche centre déjà choisi.
-    // Mis à jour incrémentalement : c'est ce qui donne O(n·k·d) et non O(n·k²·d).
     val closest = new Array[Double](n)
-    var i       = 0
-    while (i < n) { closest(i) = Distance.sqdist(points(i).coords, centers(0)); i += 1 }
+    var i = 0
+    while (i < n) { closest(i) = Distance.squareDistance(points, i, centers, 0); i += 1 }
 
     var c = 1
     while (c < kEff) {
-      // Tirage D² pondéré : P(i) ∝ w_i · closest(i)
-      val idx = Sampling.byWeight(n, j => points(j).weight * closest(j), rng)
-      centers(c) = points(idx).coords.clone()
+      val idx = Sampling.byWeight(n, j => points.weight(j) * closest(j), rng)
+      points.copyCoordinatesInto(idx, tmp)
+      centers.append(tmp, points.weight(idx))
 
       i = 0
       while (i < n) {
-        val d = Distance.sqdist(points(i).coords, centers(c))
+        val d = Distance.squareDistance(points, i, centers, c)
         if (d < closest(i)) closest(i) = d
         i += 1
       }
@@ -111,73 +110,73 @@ object KMeans {
    * Arrêt : décroissance relative du coût inférieure à `tol`, ou `maxIter` atteint.
    */
   def lloyd(
-    points:  Array[Point],
-    init:    Array[Array[Double]],
-    maxIter: Int    = 100,
-    tol:     Double = 1e-6
-  ): KMeansModel = {
-    require(points.nonEmpty, "lloyd: ensemble de points vide")
-    require(init.nonEmpty, "lloyd: aucun centre initial")
+             points:  PointsSoA,
+             init:    PointsSoA,
+             maxIter: Int    = 100,
+             tol:     Double = 1e-6
+           ): KMeansModel = {
+    require(points.n > 0, "lloyd: ensemble de points vide")
+    require(init.n > 0, "lloyd: aucun centre initial")
 
-    val k       = init.length
-    val d       = points(0).dim
-    val centers = Array.tabulate(k)(i => init(i).clone())
+    val k = init.n
+    val dimension = points.dimension
+    val centers = PointsSoA.allocate(k, dimension)
+    val tmp     = new Array[Double](dimension)
+    var c = 0
+    while (c < k) { init.copyCoordinatesInto(c, tmp); centers.append(tmp, init.weight(c)); c += 1 }
+    init.free()   // ← init entièrement copié dans centers, plus jamais utilisé après ce point
 
-    val sums   = Array.ofDim[Double](k, d)
-    val masses = new Array[Double](k)
+    val clusterSums = Array.ofDim[Double](k, dimension)
+    val masses      = new Array[Double](k)
+    val nearestResult = new NearestResult(0, 0.0)
 
     var prevCost = Double.MaxValue
     var it       = 0
     var done     = false
 
     while (!done && it < maxIter) {
-      var c = 0
+      c = 0
       while (c < k) {
-        java.util.Arrays.fill(sums(c), 0.0)
+        java.util.Arrays.fill(clusterSums(c), 0.0)
         masses(c) = 0.0
         c += 1
       }
 
-      // Étape d'affectation + accumulation des sommes pondérées, en un seul parcours.
-      // `currCost` est la SSE des centres COURANTS (avant mise à jour) : c'est bien la
-      // quantité dont la décroissance prouve la convergence de Lloyd.
       var currCost = 0.0
-      var i        = 0
-      while (i < points.length) {
-        val p        = points(i)
-        val (idx, dd) = Distance.nearest(p.coords, centers)
-        currCost += p.weight * dd
-        val s = sums(idx)
-        val w = p.weight
+      var i = 0
+      while (i < points.n) {
+        Distance.nearest(points, i, centers, nearestResult)
+        val idx    = nearestResult.index
+        val weight = points.weight(i)
+        currCost += weight * nearestResult.distance
+
+        val clusterSum = clusterSums(idx)
         var j = 0
-        while (j < d) { s(j) += w * p.coords(j); j += 1 }
-        masses(idx) += w
+        while (j < dimension) { clusterSum(j) += weight * points.coordinates(i, j); j += 1 }
+        masses(idx) += weight
         i += 1
       }
 
-      // Étape de mise à jour des centres.
       c = 0
       while (c < k) {
         if (masses(c) > 0.0) {
-          val s   = sums(c)
-          val m   = masses(c)
-          val ctr = centers(c)
-          var j   = 0
-          while (j < d) { ctr(j) = s(j) / m; j += 1 }
+          val clusterSum = clusterSums(c)
+          val mass       = masses(c)
+          var j = 0
+          while (j < dimension) { tmp(j) = clusterSum(j) / mass; j += 1 }
+          centers.set(c, tmp, centers.weight(c))
         }
         c += 1
       }
 
       it += 1
-      // Invariant de Lloyd : le coût ne remonte jamais.
       assert(currCost <= prevCost + 1e-9 * math.abs(prevCost),
-             s"Lloyd: coût non monotone ($prevCost -> $currCost) — bug d'affectation ou de pondération")
+        s"Lloyd: coût non monotone ($prevCost -> $currCost)")
 
       if (prevCost - currCost <= tol * math.max(math.abs(prevCost), 1e-300)) done = true
       prevCost = currCost
     }
 
-    // Recalcul final : `prevCost` correspond aux centres d'AVANT la dernière mise à jour.
     KMeansModel(centers, cost(points, centers), it)
   }
 
@@ -188,17 +187,17 @@ object KMeans {
    * d'expérience (E3), pas une constante.
    */
   def fit(
-    points:    Array[Point],
-    k:         Int,
-    nRestarts: Int    = 5,
-    maxIter:   Int    = 100,
-    tol:       Double = 1e-6,
-    seed:      Long   = 42L
-  ): KMeansModel = {
+           points:    PointsSoA,
+           k:         Int,
+           nRestarts: Int    = 5,
+           maxIter:   Int    = 100,
+           tol:       Double = 1e-6,
+           seed:      Long   = 42L
+         ): KMeansModel = {
     require(nRestarts > 0, s"fit: nRestarts doit être > 0 (reçu $nRestarts)")
-    val rng  = new Random(seed)
+    val rng = new Random(seed)
     var best: KMeansModel = null
-    var r    = 0
+    var r = 0
     while (r < nRestarts) {
       val model = lloyd(points, seedPlusPlus(points, k, rng), maxIter, tol)
       if (best == null || model.cost < best.cost) best = model
@@ -212,14 +211,15 @@ object KMeans {
    * C'est la mesure de qualité unique de tout le projet (thèse §4.2) : tous les
    * chapitres expérimentaux comparent des valeurs produites par cette fonction.
    */
-  def cost(points: Array[Point], centers: Array[Array[Double]]): Double = {
-    var s = 0.0
+  def cost(points: PointsSoA, centers: PointsSoA): Double = {
+    val nearestResult = new NearestResult(0, 0.0)
+    var totalCost = 0.0
     var i = 0
-    while (i < points.length) {
-      val p = points(i)
-      s += p.weight * Distance.nearest(p.coords, centers)._2
+    while (i < points.n) {
+      Distance.nearest(points, i, centers, nearestResult)
+      totalCost += points.weight(i) * nearestResult.distance
       i += 1
     }
-    s
+    totalCost
   }
 }

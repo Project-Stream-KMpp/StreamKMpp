@@ -2,8 +2,7 @@ package streamkm.coreset
 
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
-
-import streamkm.core.{Distance, Point, Sampling}
+import streamkm.core.{PointsSoA, Distance, Sampling}
 
 /**
  * Nœud de l'arbre de coreset.
@@ -22,8 +21,8 @@ import streamkm.core.{Distance, Point, Sampling}
  *               le représentant du fils gauche lors d'une scission).
  */
 private[coreset] final class Node(
-  var points: Array[Point],
-  var repr:   Array[Double],
+  var pointIndices: Array[Int], //indices in set of PointsSoA
+  var representativeIndex: Int,
   var cost:   Double,
   var mass:   Double,
   var left:   Node,
@@ -43,50 +42,55 @@ private[coreset] final class Node(
 object CoresetTree {
 
   /**
-   * Construit un coreset d'au plus `m` points pondérés à partir de `points`.
+   * Construit un coreset d'au plus `m` points à partir de `store` (le store ENTIER
+   * est réduit — pour réduire un sous-ensemble, le caller doit d'abord construire
+   * un `PointsSoA` de ce sous-ensemble, cf. `PointsSoA.concat` dans BucketManager).
    *
-   * GARANTIE STRUCTURELLE : la somme des poids de sortie est exactement égale à la somme
-   * des poids d'entrée. C'est l'invariant que testent en priorité les tests de E2 — il
-   * attrape la grande majorité des erreurs d'implémentation de cette structure.
-   *
-   * Si `points.length <= m`, l'ensemble est déjà son propre coreset : on le renvoie tel quel.
+   * Le store `store` passé en entrée est CONSOMMÉ : cette fonction en prend possession
+   * et appelle `store.free()` avant de retourner, une fois les représentants copiés
+   * dans le store de sortie. Le caller ne doit plus l'utiliser après l'appel.
    */
-  def build(points: Array[Point], m: Int, rng: Random): Array[Point] = {
-    require(m > 0, s"build: m doit être > 0 (reçu $m)")
-    if (points.length <= m) return points.clone()
-
-    // --- Racine : premier représentant tiré proportionnellement au poids ---
-    // (Thèse algo 2.4 ligne 1 : « uniformly at random ». Même remarque que pour
-    // KMeans.seedPlusPlus : sur un ensemble pondéré, le tirage proportionnel à la masse
-    // est la généralisation correcte, et les deux coïncident sur des points de poids 1.)
-    val i0   = Sampling.byWeight(points.length, i => points(i).weight, rng)
-    val root = new Node(points, points(i0).coords.clone(), 0.0, 0.0, null, null)
-    recomputeLeaf(root)
-
-    var leaves = 1
-    val path   = new ArrayBuffer[Node](32)
-
-    // Condition d'arrêt supplémentaire par rapport à l'algorithme 2.4 : `root.cost > 0`.
-    // Si le coût global est nul, tous les points sont confondus avec leur représentant :
-    // aucune scission ne peut plus rien améliorer, et l'échantillonnage D² serait dégénéré.
-    // Ce cas arrive réellement sur des données discrètes très redondantes.
-    while (leaves < m && root.cost > 0.0) {
-      path.clear()
-      val leaf = descend(root, rng, path)
-      val q    = sampleD2(leaf, rng)
-
-      if (q == null) return collectLeaves(root) // feuille de coût nul : sécurité
-      if (!split(leaf, q)) return collectLeaves(root) // scission dégénérée : sécurité
-
-      // Remontée de la mise à jour jusqu'à la racine (algo 2.4 ligne 9).
-      // `leaf` est le dernier élément du chemin et a déjà été mis à jour par `split`.
-      var i = path.length - 2
-      while (i >= 0) { recomputeInner(path(i)); i -= 1 }
-
-      leaves += 1
+  def build(setOfPoints: PointsSoA, coresetSize: Int, range: Random): PointsSoA = {
+    require(coresetSize > 0, s"build: coresetSize doit être > 0 (reçu $coresetSize)")
+    if (setOfPoints.n <= coresetSize){
+      return setOfPoints
     }
 
-    collectLeaves(root)
+    val allIndices = Array.range(0, setOfPoints.n)
+    val rootRepresentativeIndex = Sampling.byWeight(setOfPoints.n, setOfPoints.weight, range)
+    val root = new Node(allIndices, rootRepresentativeIndex, 0.0, 0.0, null, null)
+    recomputeLeaf(root, setOfPoints)
+
+    var leafCount = 1
+    val pathFromRoot = new ArrayBuffer[Node](32)
+
+    while (leafCount < coresetSize && root.cost > 0.0) {
+      pathFromRoot.clear()
+      val chosenLeaf = descend(root, range, pathFromRoot)
+      val newRepresentativeIndex = sampleD2(chosenLeaf, setOfPoints, range)
+
+      if (newRepresentativeIndex < 0){
+        val result = collectLeaves(root, setOfPoints, coresetSize)
+        setOfPoints.free()
+        return result
+      }
+
+      if (!split(chosenLeaf, newRepresentativeIndex, setOfPoints)){
+        val result = collectLeaves(root, setOfPoints, coresetSize)
+        setOfPoints.free()
+        return result
+      }
+      var pathIndex = pathFromRoot.length - 2
+      while (pathIndex >= 0){
+        recomputeInner(pathFromRoot(pathIndex))
+        pathIndex -= 1
+      }
+      leafCount += 1
+    }
+
+    val result = collectLeaves(root, setOfPoints, coresetSize)
+    setOfPoints.free()
+    result
   }
 
   // ------------------------------------------------------------------
@@ -111,18 +115,22 @@ object CoresetTree {
    *
    * `path` reçoit le chemin racine → feuille, pour la remontée.
    */
-  private def descend(root: Node, rng: Random, path: ArrayBuffer[Node]): Node = {
-    var node = root
-    path += node
-    while (!node.isLeaf) {
-      val total = node.cost
-      node =
-        if (!(total > 0.0)) node.left // sécurité : coût nul, choix arbitraire
-        else if (rng.nextDouble() * total < node.left.cost) node.left
-        else node.right
-      path += node
+  private def descend(root: Node, range: Random, pathFromRoot: ArrayBuffer[Node]): Node = {
+    var currentNode = root
+    pathFromRoot += currentNode
+
+    while (!currentNode.isLeaf) {
+      val totalCost = currentNode.cost
+      currentNode =
+        if (!(totalCost > 0.0))
+          currentNode.left // sécurité : coût nul, choix arbitraire
+        else if (range.nextDouble() * totalCost < currentNode.left.cost)
+          currentNode.left
+        else
+          currentNode.right
+      pathFromRoot += currentNode
     }
-    node
+    currentNode
   }
 
   /**
@@ -130,18 +138,16 @@ object CoresetTree {
    * proportionnelle à sa distance au carré au représentant courant (échantillonnage D²).
    * Renvoie null si la feuille est de coût nul.
    */
-  private def sampleD2(leaf: Node, rng: Random): Array[Double] = {
-    if (!(leaf.cost > 0.0)) return null
-    val pts = leaf.points
-    val idx = Sampling.byWeight(
-      pts.length,
-      i => pts(i).weight * Distance.sqdist(pts(i).coords, leaf.repr),
+  private def sampleD2(leaf: Node, setOfPoints: PointsSoA, rng: Random): Int = {
+    if (!(leaf.cost > 0.0)) return -1
+    val indices = leaf.pointIndices
+    val pickedPosition = Sampling.byWeight(
+      indices.length,
+      position => setOfPoints.weight(indices(position)) * Distance.squareDistance(setOfPoints, indices(position), leaf.representativeIndex),
       rng
     )
-    val chosen = pts(idx).coords
-    // Si le tirage retombe sur le représentant lui-même (distance nulle), la scission
-    // produirait un fils vide. Ne peut arriver que par erreur d'arrondi ; on refuse.
-    if (Distance.sqdist(chosen, leaf.repr) <= 0.0) null else chosen.clone()
+    val chosenIndex = indices(pickedPosition)
+    if (Distance.squareDistance(setOfPoints, chosenIndex, leaf.representativeIndex) <= 0.0) -1 else chosenIndex
   }
 
   /**
@@ -153,66 +159,58 @@ object CoresetTree {
    * (donc à droite). Le `false` de retour est une sécurité contre une violation de
    * cette propriété par erreur numérique.
    */
-  private def split(leaf: Node, q: Array[Double]): Boolean = {
-    val pts   = leaf.points
-    val left  = new ArrayBuffer[Point](pts.length)
-    val right = new ArrayBuffer[Point](pts.length)
+  private def split(leaf: Node, newRepresentativeIndex: Int, store: PointsSoA): Boolean = {
+    val indices        = leaf.pointIndices
+    val leftIndices  = new ArrayBuffer[Int](indices.length)
+    val rightIndices = new ArrayBuffer[Int](indices.length)
 
-    var i = 0
-    while (i < pts.length) {
-      val p = pts(i)
-      if (Distance.sqdist(p.coords, leaf.repr) <= Distance.sqdist(p.coords, q)) left += p
-      else right += p
-      i += 1
+    var position = 0
+    while (position < indices.length) {
+      val pointIndex = indices(position)
+      if (Distance.squareDistance(store, pointIndex, leaf.representativeIndex) <= Distance.squareDistance(store, pointIndex, newRepresentativeIndex))
+        leftIndices += pointIndex
+      else
+        rightIndices += pointIndex
+      position += 1
     }
+    if (leftIndices.isEmpty || rightIndices.isEmpty) return false
 
-    if (left.isEmpty || right.isEmpty) return false
+    val leftChild  = new Node(leftIndices.toArray,  leaf.representativeIndex, 0.0, 0.0, null, null)
+    val rightChild = new Node(rightIndices.toArray, newRepresentativeIndex,   0.0, 0.0, null, null)
+    recomputeLeaf(leftChild, store); recomputeLeaf(rightChild, store)
 
-    val l = new Node(left.toArray, leaf.repr, 0.0, 0.0, null, null)
-    val r = new Node(right.toArray, q, 0.0, 0.0, null, null)
-    recomputeLeaf(l)
-    recomputeLeaf(r)
-
-    leaf.points = null
-    leaf.left   = l
-    leaf.right  = r
+    leaf.pointIndices = null; leaf.left = leftChild; leaf.right = rightChild
     recomputeInner(leaf)
     true
   }
 
-  private def recomputeLeaf(n: Node): Unit = {
-    var cost = 0.0
-    var mass = 0.0
-    val pts  = n.points
-    var i    = 0
-    while (i < pts.length) {
-      val p = pts(i)
-      cost += p.weight * Distance.sqdist(p.coords, n.repr)
-      mass += p.weight
-      i += 1
+  private def recomputeLeaf(node: Node, setOfPoints: PointsSoA): Unit = {
+    var cost = 0.0; var mass = 0.0
+    val indices = node.pointIndices
+    var position = 0
+    while (position < indices.length) {
+      val pointIndex = indices(position)
+      cost += setOfPoints.weight(pointIndex) * Distance.squareDistance(setOfPoints, pointIndex, node.representativeIndex)
+      mass += setOfPoints.weight(pointIndex)
+      position += 1
     }
-    n.cost = cost
-    n.mass = mass
+    node.cost = cost; node.mass = mass
   }
 
-  private def recomputeInner(n: Node): Unit = {
-    n.cost = n.left.cost + n.right.cost
-    n.mass = n.left.mass + n.right.mass
+  private def recomputeInner(node: Node): Unit = {
+    node.cost = node.left.cost + node.right.cost
+    node.mass = node.left.mass + node.right.mass
   }
 
-  /**
-   * L'union des représentants des feuilles constitue le coreset. Le poids de chacun est
-   * la masse totale des points de sa feuille — d'où la conservation de la masse totale.
-   */
-  private def collectLeaves(root: Node): Array[Point] = {
-    val out   = new ArrayBuffer[Point]()
-    val stack = new ArrayBuffer[Node]()
-    stack += root
-    while (stack.nonEmpty) {
-      val n = stack.remove(stack.length - 1)
-      if (n.isLeaf) out += new Point(n.repr, n.mass)
-      else { stack += n.left; stack += n.right }
+  private def collectLeaves(root: Node, setOfPoints: PointsSoA, coresetSize: Int): PointsSoA = {
+    val output    = PointsSoA.allocate(coresetSize, setOfPoints.dimension)
+    val tmp       = new Array[Double](setOfPoints.dimension)
+    val nodeStack = new ArrayBuffer[Node](); nodeStack += root
+    while (nodeStack.nonEmpty) {
+      val node = nodeStack.remove(nodeStack.length - 1)
+      if (node.isLeaf) { setOfPoints.copyCoordinatesInto(node.representativeIndex, tmp); output.append(tmp, node.mass) }
+      else { nodeStack += node.left; nodeStack += node.right }
     }
-    out.toArray
+    output
   }
 }

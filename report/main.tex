@@ -1,0 +1,67 @@
+\documentclass[a4paper,11pt]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[french]{babel}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+
+% Marqueur "reste à faire" --- sans dépendance à un package externe
+% (todonotes) : chercher "PLACEHOLDER" dans les sources pour tout localiser
+% d'un coup avant le rendu final.
+\newcommand{\aCompleter}[1]{%
+  \par\noindent\fbox{\parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule}{%
+    \textbf{[PLACEHOLDER --- à compléter : #1]}%
+  }}\par\smallskip%
+}
+
+\title{StreamKM++ sur Apache Spark \\
+  \large Portage d'une implémentation Flink vers Spark}
+\author{% TODO : noms des membres du groupe
+  Groupe StreamKM++ --- M2, déploiement ML à grande échelle, Dauphine}
+\date{Août 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+\input{ch1_introduction.tex}
+\input{ch2_algorithmes.tex}
+\input{ch3_spark.tex}
+\input{ch4_implementation.tex}
+\input{ch5_evaluation.tex}
+\input{ch6_discussion.tex}
+\input{ch7_conclusion.tex}
+
+\begin{thebibliography}{9}
+
+\bibitem{bitsakis2018}
+Theodoros Bitsakis.
+\emph{Clustering Big Data Streams in Apache Flink}.
+Diploma thesis, 2018.
+
+\bibitem{ackermann2012}
+Marcel R. Ackermann, Marcus Märtens, Christiane Raupach, Kamil Swierkot,
+Christiane Lammersen, Christian Sohler.
+\emph{StreamKM++: A clustering algorithm for data streams}.
+ACM Journal of Experimental Algorithmics (JEA), 17, 2012.
+
+\bibitem{arthur2007}
+David Arthur, Sergei Vassilvitskii.
+\emph{k-means++: The Advantages of Careful Seeding}.
+Proceedings of the 18th annual ACM-SIAM symposium on Discrete algorithms, 2007.
+
+\end{thebibliography}
+
+\input{annexes.tex}
+
+\end{document}

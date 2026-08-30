@@ -1,0 +1,106 @@
+% !TeX root = main.tex
+\chapter{Discussion --- points forts et points faibles}
+\label{ch:discussion}
+
+\section{Points forts}
+
+\paragraph{Un seul passage sur les données, mémoire bornée.} Comme la thèse,
+notre implémentation ne lit chaque point qu'une seule fois et ne conserve
+qu'un résumé de taille $O(m \cdot \log(n/m))$ --- jamais l'ensemble du flux
+(chapitre~\ref{ch:algorithmes}, §\ref{sec:algo-merge-reduce}). C'est la
+propriété qui rend StreamKM++ applicable à des flux dont la taille finale
+est inconnue à l'avance, contrairement à un $k$-means batch classique.
+
+\paragraph{La fusion arborescente lève le principal goulot identifié par la
+thèse elle-même.} La thèse repère et documente (§5.3.1) que son opérateur
+\texttt{FlatMapToFinalCoreset} plafonne le speedup au-delà de 8 c\oe{}urs parce
+qu'il est non-parallèle par construction. Notre \texttt{treeReduce}
+(chapitre~\ref{ch:implementation}, §\ref{sec:impl-dataflow}) répond
+directement à cette limite --- l'expérience E7
+(chapitre~\ref{ch:evaluation}) est conçue spécifiquement pour vérifier que
+ce plafond recule effectivement.
+
+\paragraph{Simplifications nettes permises par le modèle micro-batch de
+Spark.} La disparition complète de \texttt{HandleWatermark}
+(§\ref{sec:portage-flink-spark}) et la réduction de la méthodologie
+d'évaluation du coût à trois lignes de \texttt{broadcast} +
+\texttt{treeReduce} (§\ref{sec:impl-evaluation}) sont deux exemples concrets
+où le portage n'est pas seulement possible, mais strictement plus simple
+que l'original Flink.
+
+\paragraph{Un degré de liberté expérimental que Flink n'offre pas.} Le
+découplage partitions/c\oe{}urs (§\ref{sec:spark-partitions-coeurs}) permet de
+tester directement l'explication que la thèse avance, sans pouvoir la
+vérifier, pour la baisse de coût observée quand le parallélisme augmente
+(§5.3.1, fig.~5.9) --- notre expérience E3bis comble cette lacune.
+
+\paragraph{Architecture qui protège la correction algorithmique du code de
+distribution.} La séparation stricte \texttt{core}/\texttt{coreset}/\texttt{spark}
+(chapitre~\ref{ch:introduction}) a permis de valider entièrement la logique
+de StreamKM++ (chapitre~\ref{ch:algorithmes}, 21 tests) \emph{avant}
+d'écrire une seule ligne de code Spark, et de découvrir qu'aucune extension
+de \texttt{streamkm.coreset} n'était nécessaire pour distribuer
+merge-and-reduce (chapitre~\ref{ch:implementation}) --- signe que la
+frontière entre les couches avait été bien placée dès la conception.
+
+\section{Points faibles}
+
+\paragraph{Le clustering final reste un goulot non parallèle.} Comme chez
+Flink, l'application finale de $k$-means++ sur le coreset global
+(\texttt{KMeans.fit}) tourne entièrement sur le \emph{driver} --- un temps
+constant qui, à mesure que le nombre de c\oe{}urs augmente, finit par dominer le
+temps total et plafonner le speedup (exactement ce qu'observe la thèse
+au-delà de 8 c\oe{}urs, §5.3.1). Le portage vers Spark ne résout pas ce
+problème structurel de l'algorithme lui-même ; il ne fait que repousser
+l'autre goulot (la fusion des coresets partiels,
+§\ref{sec:impl-dataflow}).
+
+\paragraph{Latence structurelle du modèle micro-batch.} Même avec un
+\texttt{Trigger} agressif, Spark Structured Streaming ne peut pas égaler la
+latence d'un moteur de vrai streaming comme Flink : un point n'est traité
+qu'à la clôture de son micro-batch, jamais immédiatement à son arrivée
+(chapitre~\ref{ch:spark}).
+
+\paragraph{Absence d'équivalent à Queryable State.} Flink permet d'interroger
+l'état interne d'un job en cours d'exécution depuis l'extérieur, sans
+latence ajoutée. Spark n'expose aucune primitive équivalente ; le
+contournement usuel (sink \texttt{memory} + requête SQL, ou écriture externe
+périodique) n'offre pas la même garantie de fraîcheur
+(§\ref{sec:impl-requetes}). C'est la seule perte de fonctionnalité nette
+identifiée dans ce portage.
+
+\paragraph{Aucune gestion du \emph{concept drift}.} Comme dans la thèse, les
+anciens buckets ne sont jamais oubliés --- un point vu au tout début du flux
+pèse dans le coreset final exactement comme un point vu à l'instant présent.
+Pour un flux dont la distribution change réellement au cours du temps, ce
+n'est pas nécessairement souhaitable, et StreamKM++ n'offre aucun mécanisme
+d'oubli (contrairement, par exemple, au facteur de décroissance de
+\texttt{StreamingKMeans} --- cf. paragraphe suivant).
+
+\paragraph{Sensibilité à l'initialisation des alternatives non garanties.}
+La comparaison à \texttt{StreamingKMeans} (chapitre~\ref{ch:evaluation},
+§\ref{sec:eval-e6}) illustre concrètement ce que la garantie théorique de
+coreset apporte en pratique : sans cette garantie, un mauvais tirage
+d'initialisation peut dégrader le résultat de plusieurs ordres de grandeur,
+sans qu'aucun signal ne le révèle en cours d'exécution. StreamKM++ n'est pas
+à l'abri d'un coreset de mauvaise qualité, mais la conservation de la masse
+et la borne théorique sur l'erreur (chapitre~\ref{ch:algorithmes}) donnent
+au moins un signal de correction vérifiable --- ce que \texttt{StreamingKMeans}
+n'offre pas.
+
+\paragraph{Non-déterminisme lié au partitionnement.} Le résultat dépend du
+nombre de partitions choisi (pas seulement du nombre de c\oe{}urs), puisque
+chaque partition construit son propre coreset intermédiaire avec sa propre
+graine (§\ref{sec:impl-dataflow}). Nous fixons les graines par partition
+pour la reproductibilité \emph{à nombre de partitions fixé}, mais deux
+exécutions avec des partitionnements différents produisent, légitimement,
+des coresets différents.
+
+\paragraph{Aucune standardisation des features.} Les expériences sur
+Covertype (chapitre~\ref{ch:evaluation}) utilisent les données brutes,
+comme le fait la thèse. Les colonnes one-hot (échelle $\{0,1\}$) et les
+mesures brutes (échelle jusqu'à $\sim 7\,000$) pèsent alors très
+différemment dans une distance euclidienne au carré --- une limite connue
+et documentée dans le code, pas corrigée pour rester fidèle au protocole de
+la thèse et pour ne pas avantager artificiellement une des méthodes
+comparées à l'expérience E6.

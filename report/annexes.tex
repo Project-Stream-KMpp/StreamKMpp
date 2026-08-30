@@ -1,0 +1,30 @@
+% !TeX root = main.tex
+\appendix
+
+\chapter{Code complet}
+\label{ap:code}
+
+Le code source complet du projet (couches \texttt{core}, \texttt{coreset},
+\texttt{spark}, \texttt{experiments}, tests ScalaTest, benchmarks JMH) est
+disponible dans le dépôt Git du groupe :
+\url{https://github.com/Project-Stream-KMpp/StreamKMpp}. Il n'est pas
+reproduit ici in extenso --- le chapitre~\ref{ch:implementation} en cite les
+fragments les plus significatifs, commentés en français et annotés des
+références aux algorithmes de la thèse, conformément aux exigences de
+l'énoncé.
+
+Commande de test : \texttt{sbt test} (compile et exécute l'ensemble de la
+suite ScalaTest). \texttt{CLAUDE.md}, à la racine du dépôt, tient à jour
+l'état d'avancement du projet et les décisions de conception prises quand la
+thèse laissait une ambiguïté.
+
+\chapter{Notebook commenté}
+\label{ap:notebook}
+
+\aCompleter{notebook exécutable (Almond ou Databricks Community) sur
+\texttt{data/small/covtype\_10k.data} --- 10\,000 lignes, extraites de
+Covertype par tirage aléatoire à graine fixe pour la reproductibilité
+(chapitre~\ref{ch:evaluation}, §\ref{sec:eval-setup}). Chaque cellule
+d'entrée/sortie doit être commentée, conformément à l'énoncé. Étape E9 du
+plan de travail du groupe, non commencée au moment de la rédaction de cette
+version du rapport.}

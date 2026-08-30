@@ -1,0 +1,54 @@
+% !TeX root = main.tex
+\chapter{Conclusion et perspectives}
+\label{ch:conclusion}
+
+Ce rapport a décrit le portage de StreamKM++ depuis l'implémentation Flink
+de Bitsakis (2018) vers Apache Spark. Les trois briques algorithmiques de la
+thèse --- Lloyd pondéré, seeding $k$-means++, coreset tree et
+merge-and-reduce --- ont été implémentées et validées indépendamment de tout
+moteur de calcul distribué (chapitre~\ref{ch:algorithmes}), avant d'être
+orchestrées par une couche Spark qui ne contient elle-même aucune logique
+algorithmique propre (chapitre~\ref{ch:implementation}). Cet ordre --- théorie,
+puis framework, puis implémentation opérateur par opérateur, puis validation
+de la qualité avant la scalabilité --- a été tenu tout au long du projet, et
+a permis de découvrir et corriger un bug réel (une graine aléatoire mal
+propagée dans la fusion de coresets) avant qu'il n'affecte les expériences
+du chapitre~\ref{ch:evaluation}.
+
+Le portage confirme ce que l'énoncé posait comme question implicite : une
+partie du dataflow de la thèse se traduit directement (voire se simplifie,
+comme la disparition de \texttt{HandleWatermark} ou la méthodologie
+d'évaluation du coût), une partie se traduit avec un gain net (la fusion
+arborescente des coresets, qui répond directement au goulot que la thèse
+identifie elle-même), et une partie ne se traduit pas du tout (Queryable
+State) --- sans que cela remette en cause la viabilité du portage dans son
+ensemble (chapitre~\ref{ch:discussion}).
+
+\section{Travaux futurs}
+
+\paragraph{Variante à requêtes périodiques (§4.3 de la thèse).} Décrite mais
+non implémentée faute de temps (chapitre~\ref{ch:implementation},
+§\ref{sec:impl-requetes}) --- le chemin d'implémentation est cependant déjà
+balisé : \texttt{Trigger.ProcessingTime} pour la ré-évaluation périodique,
+\texttt{BucketManager.extractCoreset} (qui ne vide jamais l'état) pour
+dupliquer le coreset courant à plusieurs valeurs de $k$.
+
+\paragraph{Un vrai équivalent de Queryable State.} La seule perte de
+fonctionnalité nette identifiée dans ce portage
+(chapitre~\ref{ch:discussion}). Une piste non explorée : un service externe
+léger interrogeant directement l'état exposé par \texttt{onModel}, plutôt
+qu'un sink \texttt{memory} + SQL --- à évaluer en termes de fraîcheur et de
+complexité ajoutée.
+
+\paragraph{Gestion du concept drift.} Ajouter un mécanisme d'oubli
+(fenêtre glissante sur les buckets les plus anciens, ou facteur de
+décroissance à la \texttt{StreamingKMeans}) permettrait de traiter des flux
+dont la distribution change réellement dans le temps --- hors du périmètre
+de StreamKM++ tel que défini par la thèse, mais une extension naturelle.
+
+\paragraph{Poursuivre l'optimisation du kernel local.} Le travail
+Structure-of-Arrays / hors-tas engagé sur \texttt{core}/\texttt{coreset}
+(chapitre~\ref{ch:evaluation}, benchmarks JMH) ouvre la voie à des
+optimisations supplémentaires une fois les résultats consolidés --- en
+particulier sur \texttt{CoresetTree.build}, identifié dès la spécification
+initiale comme le point chaud principal du pipeline.

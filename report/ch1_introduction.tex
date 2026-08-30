@@ -1,0 +1,63 @@
+% !TeX root = main.tex
+\chapter{Introduction}
+\label{ch:introduction}
+
+Le clustering $k$-means classique suppose que l'ensemble des points tient en
+mémoire et peut être relu autant de fois que nécessaire. Cette hypothèse
+s'effondre dès que les données arrivent en flux continu : un capteur, un
+flux de clics, un flux de transactions. On ne peut ni tout stocker, ni
+relire deux fois le même point, et pourtant on veut un clustering de qualité
+comparable à ce qu'on obtiendrait en traitant les données par lots.
+
+\textsc{StreamKM++} (Ackermann et al., 2012) répond à ce problème par la
+technique du \emph{coreset} : au lieu de conserver le flux, on en maintient
+un résumé pondéré de taille bornée $m$, construit incrémentalement, tel que
+le coût de clustering calculé sur ce résumé approxime le coût de clustering
+sur les données complètes, pour n'importe quel jeu de centres (Définition 2.2
+de la thèse de référence). Un seul passage sur les données suffit, et la
+mémoire utilisée ne dépend que de $m$ et $\log(n)$, jamais de $n$
+directement.
+
+\paragraph{Objet de ce rapport.} Bitsakis (2018) implémente StreamKM++ dans
+Apache Flink et l'évalue de façon approfondie (chapitres 4 et 5 de sa
+thèse). Notre travail consiste à \textbf{porter cette implémentation vers
+Apache Spark}, dans le cadre du cours de déploiement ML à grande échelle de
+ce M2. Ce portage n'est pas une simple traduction syntaxique : Flink et
+Spark reposent sur des modèles d'exécution différents (état par
+\emph{subtask} adressable vs. RDD immuables et micro-batch), et une partie
+du travail intéressant de ce rapport consiste précisément à identifier ce
+qui se traduit directement, ce qui demande une réinterprétation, et ce qui
+n'a tout simplement pas d'équivalent côté Spark (chapitre~\ref{ch:implementation},
+§\ref{sec:portage-flink-spark}).
+
+\paragraph{Méthode.} Nous avons suivi la même progression que la thèse de
+référence, dans le même ordre : comprendre la théorie avant d'écrire du
+code (chapitre~\ref{ch:algorithmes}), décrire le modèle d'exécution cible
+avant de l'utiliser (chapitre~\ref{ch:spark}), implémenter opérateur par
+opérateur en partant d'une version simple avant d'ajouter des raffinements
+(chapitre~\ref{ch:implementation}), et enfin valider la \emph{qualité} du
+clustering avant de mesurer sa \emph{scalabilité}
+(chapitre~\ref{ch:evaluation}) --- mesurer un speedup sur un algorithme dont
+le résultat serait faux n'aurait aucun sens. Cet ordre n'est pas seulement
+une méthode de travail : c'est aussi le plan de ce rapport.
+
+\paragraph{Architecture logicielle.} Le code est organisé en trois couches
+strictement séparées, une contrainte de conception que nous avons tenue tout
+au long du projet :
+
+\begin{itemize}
+  \item \texttt{streamkm.core} --- $k$-means, $k$-means++, distance
+    euclidienne au carré. Pur Scala, aucune dépendance.
+  \item \texttt{streamkm.coreset} --- l'arbre de coreset et la technique
+    merge-and-reduce. Pur Scala, sérialisable, testable sans JVM Spark.
+  \item \texttt{streamkm.spark} --- l'orchestration Spark (RDD,
+    \texttt{treeReduce}, Structured Streaming). Aucune logique
+    algorithmique n'y vit : cette couche ne fait que distribuer des appels
+    aux deux précédentes.
+\end{itemize}
+
+Cette séparation permet de tester et de faire du micro-benchmarking sur les
+deux premières couches indépendamment de tout cluster Spark
+(chapitre~\ref{ch:evaluation}, §\ref{sec:eval-scalabilite}), et elle rend
+visible, dans le code même, la frontière entre « ce qui est StreamKM++ » et
+« ce qui est Spark ».

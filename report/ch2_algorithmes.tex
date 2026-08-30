@@ -1,0 +1,252 @@
+% !TeX root = main.tex
+% Chapitre 2 --- Algorithmes
+% Barème visé : "Algorithmes + description globale" (3 pts), cf. METHODO §1.
+% Références : Bitsakis (2018) ch. 2 ; Ackermann et al. (2012), StreamKM++, JEA 17.
+%
+% Ce chapitre décrit les quatre briques algorithmiques empilées par StreamKM++
+% (Lloyd → k-means++ → coreset tree → merge-and-reduce), dans l'ordre où
+% chacune sert de fondation à la suivante --- même ordre que le §1.1 de la
+% thèse et que notre méthodologie de développement (METHODO §0).
+%
+% Nécessite dans le préambule du document principal :
+%   \usepackage{algorithm}
+%   \usepackage{algpseudocode}
+%   \usepackage{amsmath}
+
+\chapter{Algorithmes}
+\label{ch:algorithmes}
+
+StreamKM++ répond à un problème que le $k$-means classique ne peut pas
+traiter tel quel : un flux de points trop volumineux pour tenir en mémoire,
+qu'on ne peut lire qu'une seule fois. La solution retenue par Ackermann
+et al. (2012) et reprise par Bitsakis (2018) consiste à maintenir en
+permanence un \emph{coreset} --- un résumé pondéré de taille bornée $m$,
+construit incrémentalement, tel que le clustering optimal du coreset
+approxime le clustering optimal des données complètes (Définition 2.2,
+thèse). Ce chapitre décrit les quatre briques qui rendent cela possible,
+et pour chacune, les décisions prises par le groupe lorsque la thèse
+laissait une ambiguïté. Le code correspondant vit dans \texttt{streamkm.core}
+(§\ref{sec:algo-lloyd}--\ref{sec:algo-kmeanspp}) et \texttt{streamkm.coreset}
+(§\ref{sec:algo-coreset-tree}--\ref{sec:algo-merge-reduce}) ; le portage de ces
+briques vers Spark fait l'objet du chapitre~4.
+
+\section{Algorithme de Lloyd pondéré}
+\label{sec:algo-lloyd}
+
+L'algorithme de Lloyd (thèse, algorithme 2.1) alterne deux étapes jusqu'à
+convergence : affecter chaque point au centre le plus proche, puis recentrer
+chaque centre sur la moyenne de son cluster.
+
+\begin{algorithm}[H]
+\caption{Lloyd pondéré (thèse, algo. 2.1 --- \texttt{KMeans.lloyd})}
+\begin{algorithmic}[1]
+\Require points pondérés $P = \{(p_i, w_i)\}_{i=1}^n$, centres initiaux $C = \{c_1,\dots,c_k\}$
+\Repeat
+  \For{chaque point $p_i \in P$}
+    \State affecter $p_i$ au centre $c_j$ le plus proche (distance au carré)
+  \EndFor
+  \For{chaque cluster $j$}
+    \State $c_j \gets \dfrac{\sum_{p_i \in \text{cluster } j} w_i \cdot p_i}{\sum_{p_i \in \text{cluster } j} w_i}$
+  \EndFor
+\Until{$|\Delta\,\mathrm{coût}| < \mathit{tol}$ ou \textit{maxIter} atteint}
+\Ensure centres $C$, coût $= \sum_i w_i \cdot \min_j \lVert p_i - c_j\rVert^2$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Pourquoi « pondéré » n'est pas un détail.}
+La thèse énonce l'algorithme sur des points bruts, tous de poids~1. Mais dans
+StreamKM++, Lloyd n'est \emph{jamais} appliqué qu'à un coreset --- un ensemble
+où le poids d'un point représente la masse d'un sous-ensemble entier de
+points originaux (cf. §\ref{sec:algo-coreset-tree}). Un centre recalculé
+comme une moyenne \emph{non} pondérée produirait un résultat silencieusement
+faux : le code compile, l'algorithme converge, mais vers un optimum qui
+n'a plus de rapport avec les données réelles. C'est le piège classique de
+StreamKM++, identifié dès la phase de conception du groupe (METHODO, étape
+E1) et vérifié par un test dédié (\texttt{KMeansSpec}, « un point de poids
+$w$ équivaut à $w$ copies du même point ») : un point de poids 3 doit
+produire exactement le même centre que trois copies de poids 1 du même point.
+
+\paragraph{Un invariant vérifié en continu.}
+Le coût de Lloyd décroît de façon monotone à chaque itération --- propriété
+classique de l'algorithme, mais aussi le signal de correction le plus direct
+en cas de bug d'affectation ou de pondération. \texttt{KMeans.lloyd} le
+vérifie par une assertion active en mode debug (\texttt{-ea}), plutôt que de
+faire confiance silencieusement à la convergence numérique.
+
+\paragraph{Clusters vides.} Si un cluster ne reçoit aucun point à une
+itération, son centre est conservé tel quel plutôt que ré-initialisé. Ce
+choix, plus simple que l'alternative classique (ré-amorcer sur le point le
+plus éloigné), a aussi l'avantage de préserver la monotonie du coût --- un
+cluster vide contribue 0, une ré-initialisation aurait pu faire remonter le
+coût et casser l'invariant ci-dessus.
+
+\section{Seeding \texorpdfstring{$k$}{k}-means++}
+\label{sec:algo-kmeanspp}
+
+Une initialisation aléatoire de Lloyd converge souvent vers un optimum local
+médiocre. Le seeding $k$-means++ (thèse, algorithme 2.2) choisit les centres
+initiaux avec une probabilité proportionnelle au carré de leur distance au
+centre déjà choisi le plus proche (échantillonnage $D^2$), ce qui répartit
+les centres sur les amas plutôt que de les laisser s'accumuler.
+
+\begin{algorithm}[H]
+\caption{Seeding $D^2$ pondéré (thèse, algo. 2.2 lignes 1--3 --- \texttt{KMeans.seedPlusPlus})}
+\begin{algorithmic}[1]
+\Require points pondérés $P$, nombre de centres $k$
+\State $c_1 \gets$ un point de $P$ tiré \emph{proportionnellement à son poids} \Comment{voir remarque ci-dessous}
+\For{$c \gets 2$ \textbf{à} $k$}
+  \State $\mathit{closest}(p) \gets \min_{j<c} \lVert p - c_j\rVert^2$ pour chaque $p \in P$
+  \State $c_c \gets$ un point $p \in P$ tiré avec probabilité $\propto w_p \cdot \mathit{closest}(p)$
+\EndFor
+\Ensure $k$ centres $\{c_1,\dots,c_k\}$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Écart assumé par rapport à la thèse : premier centre non uniforme.}
+L'algorithme 2.2 (ligne 1) tire le tout premier centre \emph{uniformément}
+parmi les points. Notre implémentation le tire proportionnellement au poids.
+Sur des points bruts (tous de poids 1) les deux tirages coïncident
+exactement --- l'écart n'a donc \emph{aucun effet} sur l'algorithme 2.2 pris
+isolément. Mais dans le pipeline complet de StreamKM++, $k$-means++ n'est
+jamais appliqué qu'à un coreset (thèse, §2.3.4, étape 2), où les poids sont
+très hétérogènes : un tirage uniforme y biaiserait systématiquement
+l'initialisation vers les régions les moins densément représentées par les
+données d'origine. Le tirage proportionnel au poids est donc la
+généralisation correcte de la ligne 1 au cas pondéré, pas une simplification.
+La même remarque s'applique, pour la même raison, au premier représentant du
+coreset tree (§\ref{sec:algo-coreset-tree}).
+
+\paragraph{Complexité.} Le calcul incrémental de $\mathit{closest}(p)$ --- mis
+à jour à chaque nouveau centre plutôt que recalculé depuis zéro --- donne un
+coût en $O(n \cdot k \cdot d)$ et non $O(n \cdot k^2 \cdot d)$.
+
+\paragraph{Combiner les deux : \texttt{KMeans.fit}.} La thèse (§2.3.4,
+étape 2) applique cinq fois la combinaison seeding + Lloyd et retient le
+clustering de coût minimal --- c'est \texttt{KMeans.fit(points, k, nRestarts=5)}.
+Le §5.3.1 de la thèse montre qu'une seule application suffit en pratique ;
+\texttt{nRestarts} reste un paramètre expérimental (E3, ch.~5), pas une
+constante algorithmique figée.
+
+\section{Construction du coreset : le coreset tree}
+\label{sec:algo-coreset-tree}
+
+Un coreset au sens de la Définition 2.2 (thèse) peut être obtenu par un tirage
+$D^2$ direct sur l'ensemble des points (\texttt{AdaptiveCoreset}, algo.~2.3),
+mais au prix d'une complexité $\Theta(dnm)$ --- chaque nouveau point du coreset
+impose de reparcourir tous les points d'origine. Le \emph{coreset tree}
+(thèse, §2.3.3, algo.~2.4) ramène cette complexité à $O(dm^2)$ en organisant
+la construction comme un clustering hiérarchique divisif : chaque n\oe{}ud de
+l'arbre porte un sous-ensemble de points et un représentant, la racine porte
+l'ensemble complet, et chaque scission raffine localement le coreset sans
+retoucher les autres branches.
+
+\begin{algorithm}[H]
+\caption{Coreset tree (thèse, algo. 2.4 --- \texttt{CoresetTree.build})}
+\begin{algorithmic}[1]
+\Require points pondérés $P$, taille cible $m \le |P|$
+\State $q_1 \gets$ un point de $P$ tiré proportionnellement à son poids \Comment{cf. remarque §\ref{sec:algo-kmeanspp}}
+\State racine $\gets$ n\oe{}ud unique contenant $P$, représentant $q_1$
+\For{$i \gets 2$ \textbf{à} $m$}
+  \State $\ell \gets$ descendre de la racine à une feuille, un fils choisi $\propto$ son \textsc{coût} \Comment{§\ref{par:cost-vs-mass}}
+  \State $q_i \gets$ un point de la feuille $\ell$ tiré $\propto$ sa distance au carré au représentant de $\ell$ (éch. $D^2$)
+  \State scinder $\ell$ en deux nouvelles feuilles (une par représentant $q_\ell, q_i$)
+  \State remonter la mise à jour du coût/de la masse jusqu'à la racine
+\EndFor
+\Ensure $S = \{q_1,\dots,q_m\}$, chaque $q_i$ pondéré par la masse de sa feuille
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{L'ambiguïté centrale de la thèse, et comment on l'a tranchée.}
+\label{par:cost-vs-mass}
+La thèse attache à chaque n\oe{}ud $v$ un attribut \texttt{weight(v)}, défini
+juste avant l'algorithme 2.4 comme $\mathrm{cost}(P_v, q_v)$ --- une somme de
+distances au carré --- mais réutilise ensuite ce \emph{même mot} « weight »,
+au §2.3.4, pour désigner la masse (le nombre de points) que représente
+chaque point du coreset final. Ce sont deux quantités de nature complètement
+différente portant le même nom. Notre implémentation les sépare
+explicitement dans \texttt{CoresetTree.Node} : le champ \texttt{cost}
+(la somme de distances au carré, qui pilote la descente dans l'arbre, étape 1
+du §2.3.3) et le champ \texttt{mass} (la masse, qui devient le poids du point
+de sortie). Les confondre produit un algorithme qui compile, tourne sans
+erreur, et construit un coreset dont les poids sont faux --- un bug purement
+silencieux.
+
+Une seconde ambiguïté découle directement de la première : le §2.3.3, étape~1
+dit en prose que la descente choisit une feuille « avec une probabilité
+proportionnelle à $\mathrm{cost}(P_\ell, q_\ell)$ », mais la ligne~5 de
+l'algorithme~2.4 dit « selon leurs \emph{weights} ». En comprenant
+\texttt{weight(v)} au sens de sa définition (= cost), les deux formulations
+concordent --- c'est cette lecture que confirme le papier original d'Ackermann
+et al., et c'est donc le \textbf{coût}, pas la masse, qui pilote la descente
+dans \texttt{CoresetTree.descend}. Le raisonnement le confirme aussi a
+posteriori : une feuille déjà bien approximée par son représentant (coût
+faible) n'a pas besoin d'être raffinée davantage ; utiliser la masse à la
+place ferait dériver l'algorithme vers un simple échantillonnage
+proportionnel à la densité, ce qui lui ferait perdre sa propriété de coreset.
+
+\paragraph{Invariant vérifié.} La somme des poids en sortie du coreset tree
+est \emph{exactement} égale à la somme des poids en entrée --- c'est le test
+le plus discriminant de toute la couche \texttt{coreset}
+(\texttt{CoresetSpec}, « conserve exactement la masse totale ») : un coreset
+dont la masse ne se conserve pas est faux, quelle que soit par ailleurs
+la plausibilité de ses centres.
+
+\section{Merge-and-reduce}
+\label{sec:algo-merge-reduce}
+
+Le coreset tree construit un coreset à partir d'un ensemble de points connu
+d'avance. Pour un \emph{flux}, StreamKM++ ajoute une seconde couche : la
+technique merge-and-reduce (thèse, §2.3.4, algo.~2.5), qui maintient un
+ensemble de « seaux » (\emph{buckets}) $B_0, B_1, \dots$ et applique le
+coreset tree pour les fusionner à la demande, sans jamais avoir besoin de
+connaître $n$ à l'avance.
+
+\begin{algorithm}[H]
+\caption{Insertion dans le flux (thèse, algo. 2.5 --- \texttt{BucketManager.insert})}
+\begin{algorithmic}[1]
+\Require point $p$, taille de coreset $m$
+\State insérer $p$ dans $B_0$
+\If{$B_0$ est plein ($m$ points)}
+  \State $S \gets$ ensemble vide, $i \gets 1$
+  \State déplacer les points de $B_0$ dans $S$, vider $B_0$
+  \While{$B_i$ est non vide}
+    \State $S \gets \textsc{CoresetTree}(S \cup B_i,\, m)$ \Comment{réduction à $m$ points}
+    \State vider $B_i$ ;\; $i \gets i+1$
+  \EndWhile
+  \State déplacer $S$ dans $B_i$
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Invariants (thèse, §2.3.4, propriétés 1--2), vérifiés par
+\texttt{checkInvariants}.} $B_0$ contient entre 0 et $m$ points bruts (poids
+1) ; pour $i \ge 1$, $B_i$ est soit vide, soit contient \emph{exactement} $m$
+points, et représente alors $2^{i-1} \cdot m$ points du flux d'origine. Le
+nombre de buckets alloués croît en $O(\log(n/m))$ : les niveaux sont créés
+à la demande, sans jamais avoir besoin de $n$ a priori --- condition
+essentielle pour un flux dont la taille finale est inconnue.
+
+\paragraph{Le coreset final.} À tout instant, l'union de tous les buckets
+non vides (\texttt{BucketManager.union}) constitue un résumé valide de tout
+ce qui a été vu jusqu'ici, borné par $m \cdot (\lceil\log_2(n/m)\rceil + 2)$
+points pondérés (thèse, §2.3.4, clarification~2). Interroger cette union
+n'interrompt pas la consommation du flux : c'est ce qui permettra, en
+extension future (ch.~4, §4.3), de ré-évaluer le clustering périodiquement
+sans tout reconstruire.
+
+\paragraph{Fusion de deux structures indépendantes.} La thèse observe
+(§2.3.4) que (1)~l'union de deux $\varepsilon$-coresets d'ensembles disjoints
+est un $\varepsilon$-coreset de leur union, et que (2)~un $\varepsilon$-coreset
+d'un $\delta$-coreset est un $\big((1+\varepsilon)(1+\delta)-1\big)$-coreset ---
+l'erreur se compose \emph{multiplicativement}, pas additivement, à chaque
+niveau de fusion. \texttt{BucketManager.merge} implémente exactement cette
+opération pour deux managers indépendants (par exemple, deux partitions
+distinctes d'un même flux), sans modifier ni l'un ni l'autre. Le résultat est
+un manager « collapsé » --- un coreset unique de taille $m$, plus un simple
+empilement de buckets valides --- dont toute insertion ultérieure est
+délibérément refusée : sémantiquement, un manager fusionné est un résultat,
+pas un flux qu'on continuerait à alimenter. Cette opération est le point de
+départ direct du portage vers Spark (ch.~4) : elle a exactement la signature
+d'un \texttt{combOp} de \texttt{treeReduce}, ce qui explique pourquoi la
+couche \texttt{streamkm.spark} n'a eu besoin d'aucune modification de
+\texttt{streamkm.coreset} pour distribuer merge-and-reduce sur un cluster.

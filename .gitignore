@@ -27,3 +27,11 @@ out/
 # sbt-launcher / ivy cache leftovers occasionnellement locaux au repo
 .history
 .cache
+
+# Artefacts de compilation LaTeX (report/) — régénérés par tectonic/pdflatex,
+# seules les sources .tex sont versionnées.
+report/*.pdf
+report/*.aux
+report/*.log
+report/*.toc
+report/*.out

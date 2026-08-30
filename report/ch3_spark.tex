@@ -1,0 +1,125 @@
+% !TeX root = main.tex
+\chapter{Apache Spark}
+\label{ch:spark}
+
+La thèse de référence consacre son chapitre~3 à décrire Flink \emph{avant}
+d'en présenter l'implémentation (chapitre~4), parce que le dataflow proposé
+est directement contraint par ce que le modèle d'exécution sait faire : état
+par \emph{subtask}, \emph{watermarks}, diffusion (\emph{broadcast}). Nous
+suivons la même logique avec Spark : ce chapitre décrit les mécanismes sur
+lesquels s'appuie notre implémentation (chapitre~\ref{ch:implementation}),
+avant de la présenter.
+
+\section{RDD et DataFrame}
+
+Spark expose deux abstractions principales pour les données distribuées.
+Un \texttt{RDD} (\emph{Resilient Distributed Dataset}) est une collection
+immuable, partitionnée, d'objets Scala arbitraires --- c'est l'abstraction
+que nous utilisons pour manipuler des \texttt{streamkm.core.Point}, une
+classe qui n'a pas de schéma de colonnes et ne bénéficie donc d'aucune
+optimisation particulière à être représentée en \texttt{DataFrame}. Un
+\texttt{DataFrame} est une table distribuée typée par un schéma de colonnes,
+optimisée par le moteur Catalyst (plan logique, plan physique, génération de
+code) --- c'est l'abstraction que nous utilisons pour la source du flux
+(\texttt{streamkm.spark.StreamKMPlusPlus.run}), avant de repasser en RDD dès
+que le traitement touche à la logique de \textsc{StreamKM++} elle-même.
+
+Ce choix --- \texttt{DataFrame} en entrée, \texttt{RDD} dès qu'on entre dans
+notre propre logique --- est délibéré : \texttt{Point} n'est pas une
+\texttt{case class} (cf. \texttt{streamkm.core.Point}), et lui construire un
+\texttt{Encoder} Spark pour bénéficier de Catalyst sur ce type n'aurait
+apporté aucun gain (aucune requête, aucune agrégation column-oriented n'est
+faite sur un \texttt{Point}), au prix d'un couplage supplémentaire entre
+\texttt{core} et Spark --- exactement ce que la « règle d'or » de notre
+architecture (§\ref{ch:introduction}) interdit.
+
+\section{Micro-batch et vrai streaming}
+
+Flink est un moteur de \emph{vrai streaming} : chaque événement est traité
+dès son arrivée, avec un état persistant entre événements. Spark Structured
+Streaming, malgré son nom, reste fondamentalement un moteur de
+\emph{micro-batch} : le flux est découpé en petits lots (déclenchés par un
+\texttt{Trigger}, par exemple un intervalle de temps ou l'arrivée d'un
+fichier), et chaque lot est traité comme un \texttt{DataFrame} borné
+ordinaire, via \texttt{foreachBatch}. Cette différence de modèle a une
+conséquence directe et positive pour notre portage : la thèse doit détecter
+elle-même la fin d'un fichier en interceptant le mécanisme de
+\emph{watermark} de Flink (opérateur \texttt{HandleWatermark}, §4.1 de la
+thèse) ; avec Spark, la frontière entre deux lots est \textbf{explicite} ---
+\texttt{foreachBatch} est appelé une fois par micro-batch, sans bricolage
+nécessaire. C'est le premier exemple concret, développé au
+chapitre~\ref{ch:implementation}, de ce qui se simplifie dans le portage.
+
+En contrepartie, le micro-batch introduit une latence structurelle
+qu'un vrai moteur de streaming n'a pas : un point n'est traité qu'à la
+clôture de son lot, jamais immédiatement à son arrivée. Nous revenons sur
+ce compromis au chapitre~\ref{ch:discussion}.
+
+\section{Diffusion (\texttt{broadcast})}
+
+Quand une valeur doit être lue, identique, par toutes les tâches d'un job
+(par exemple un jeu de centres déjà calculé), l'envoyer une fois par tâche
+gaspillerait de la bande passante réseau proportionnellement au nombre de
+partitions. \texttt{SparkContext.broadcast} envoie la valeur une seule fois
+par exécuteur (et non par tâche), et la met en cache localement pour toute
+la durée de vie du \texttt{Broadcast}. Nous l'utilisons dans
+\texttt{streamkm.spark.CostEvaluator.cost} pour diffuser les centres avant
+de calculer, en parallèle, le coût de chaque partition
+(chapitre~\ref{ch:implementation}, §\ref{sec:impl-evaluation}) --- l'exact
+équivalent Spark de l'opérateur \texttt{FlatMapToCentroid} + \texttt{.broadcast()}
+de la thèse (§4.2).
+
+\section{\texttt{treeReduce} et \texttt{treeAggregate}}
+\label{sec:spark-treereduce}
+
+Réduire les résultats de $N$ partitions vers le \emph{driver} peut se faire
+de deux façons : \textbf{linéairement} (chaque partition envoie son résultat
+directement au driver, qui les combine un par un --- $O(N)$ étapes
+séquentielles sur le driver), ou en \textbf{arbre}
+(\texttt{treeReduce}/\texttt{treeAggregate} : les résultats sont combinés
+par paires à travers plusieurs paliers intermédiaires, $O(\log N)$ étapes
+séquentielles, le reste en parallèle). Pour un grand nombre de partitions, la
+réduction linéaire concentre tout le travail de fusion sur un seul n\oe{}ud ---
+exactement le défaut que la thèse identifie dans son propre opérateur
+\texttt{FlatMapToFinalCoreset} (§4.1, non-parallèle par construction) comme
+le goulot qui plafonne le speedup au-delà de 8 c\oe{}urs (§5.3.1). C'est le point
+central de notre apport par rapport à la thèse
+(chapitre~\ref{ch:implementation}, §\ref{sec:impl-dataflow}) : nous
+remplaçons cette fusion séquentielle par une fusion en arbre.
+
+Nous utilisons \texttt{treeReduce} plutôt que \texttt{treeAggregate} pour la
+fusion des coresets : \texttt{treeAggregate(zeroValue)(seqOp, combOp, depth)}
+clone un \texttt{zeroValue} \emph{unique} (donc une seule graine aléatoire)
+pour chaque partition, ce qui casserait la reproductibilité par partition
+requise par notre protocole expérimental (chapitre~\ref{ch:evaluation},
+§\ref{sec:eval-scalabilite}). \texttt{mapPartitionsWithIndex} (une graine
+dérivée de l'indice de partition) suivi de \texttt{treeReduce} réalise la
+même opération --- un accumulateur construit une fois par partition, fusionné
+en arbre --- sans ce biais. Ce choix, documenté dans le code
+(\texttt{StreamKMPlusPlus.mergeCoresets}), est un écart assumé par rapport à
+l'exemple de pipeline de notre spécification interne, pas par rapport à ses
+invariants.
+
+\section{Partitions et c\oe{}urs : deux leviers découplés}
+\label{sec:spark-partitions-coeurs}
+
+Chez Flink, le \emph{parallélisme} est un seul nombre : il fixe à la fois le
+nombre de \emph{subtasks} et le nombre de listes de \emph{buckets}
+merge-and-reduce actives. Chez Spark, ces deux choses sont
+\textbf{découplées} : le \textbf{nombre de partitions} détermine le nombre
+d'accumulateurs \texttt{BucketManager} indépendants (donc la
+\emph{qualité} --- plus de partitions, plus de coresets partiels, un
+raffinement plus fin) ; le \textbf{nombre de c\oe{}urs} détermine le
+\emph{débit} de traitement (donc le \emph{temps}). La thèse observe que le
+coût \emph{diminue} quand le parallélisme Flink augmente (§5.3.1,
+fig.~5.9) et l'attribue à la multiplication des listes de buckets --- mais
+elle ne peut pas isoler cet effet de celui du nombre de c\oe{}urs, puisque les
+deux varient ensemble chez Flink. Le découplage de Spark permet de tester
+cette explication directement, en fixant les c\oe{}urs et en faisant varier
+uniquement les partitions (chapitre~\ref{ch:evaluation},
+§\ref{sec:eval-scalabilite}, expérience E3bis) --- une vérification que le
+modèle de Flink ne permet tout simplement pas de faire, et qui constitue
+l'une de nos contributions propres à ce rapport. En pratique, cela signifie
+que \texttt{spark.sql.shuffle.partitions} et le nombre de partitions des RDD
+manipulés sont toujours fixés explicitement dans notre code
+(\texttt{repartition(N)}), jamais laissés à la décision de Spark.

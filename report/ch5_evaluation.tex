@@ -1,0 +1,219 @@
+% !TeX root = main.tex
+% Structure de ce chapitre imposée par METHODO_StreamKMpp_Spark.md §5 :
+%   5.1 Setup --- 5.2 Qualité (E1, E2, E6) --- 5.3 Scalabilité (E3, E3bis, E4, E5, E7)
+% et par la règle d'ordre du §0 : qualité avant scalabilité, jamais l'inverse
+% (mesurer un speedup sur un algorithme dont le résultat serait faux ne veut
+% rien dire).
+%
+% La macro \aCompleter (marqueur "reste à faire", cherchable via "PLACEHOLDER")
+% est définie dans main.tex, avant le premier \input.
+
+\chapter{Évaluation expérimentale}
+\label{ch:evaluation}
+
+Conformément à notre méthodologie de travail (chapitre~\ref{ch:introduction}),
+la qualité du clustering est validée \emph{avant} sa scalabilité : mesurer un
+speedup sur un algorithme dont le résultat serait faux n'aurait aucun sens.
+Ce chapitre suit donc le même ordre.
+
+\section{Protocole et environnement}
+\label{sec:eval-setup}
+
+\aCompleter{caractéristiques exactes de la machine d'exécution (CPU, nombre
+de c\oe{}urs physiques/logiques, RAM) une fois les expériences de
+scalabilité (§\ref{sec:eval-scalabilite}) lancées sur la machine définitive
+--- sans cette information, aucune mesure de temps n'est interprétable.}
+
+Versions logicielles (fixées dans \texttt{build.sbt} et
+\texttt{project/build.properties}) : Scala 2.12.18, Spark 3.5.3, sbt 1.9.9,
+exécution en \texttt{local[*]} (pas de cluster multi-machines). Java~17 est
+requis pour Spark --- Java~26, disponible par défaut sur certains postes du
+groupe, casse l'initialisation de \texttt{SparkContext}
+(\texttt{UserGroupInformation.getCurrentUser}, incompatibilité connue entre
+Hadoop et les versions récentes du JDK).
+
+Jeu de données : \textbf{Covertype} (UCI ML Repository), 581\,012 points en
+54 dimensions (10 mesures continues + 44 colonnes one-hot), retenu par le
+groupe plutôt que des gaussiennes synthétiques pour les expériences de
+qualité --- c'est en haute dimension que le coreset est le plus mis à
+l'épreuve, et la thèse de référence rapporte elle-même des résultats sur ce
+jeu de données (§5.2.2), ce qui permet une comparaison. Aucune feature n'est
+standardisée (cf. \texttt{CovertypeLoader}/\texttt{QualityMetrics.loadCovertype}) ---
+limite discutée au chapitre~\ref{ch:discussion}. Un extrait de 10\,000 lignes
+(tirage aléatoire, graine fixe) sert aux tests rapides et au notebook de
+l'annexe~\ref{ap:notebook}.
+
+\section{Qualité (E1, E2, E6)}
+\label{sec:eval-qualite}
+
+L'instrument de mesure utilisé pour toutes les expériences de cette section
+est \texttt{streamkm.spark.CostEvaluator.cost}
+(chapitre~\ref{ch:implementation}, §\ref{sec:impl-evaluation}) : le coût est
+\textbf{toujours} recalculé sur l'ensemble des données complètes, jamais
+mesuré sur le coreset lui-même, qui n'est pas comparable.
+
+\subsection{E1 --- Correction}
+
+Vérifier que le clustering retrouvé correspond à une structure connue
+d'avance. Protocole : mélange de gaussiennes synthétique à centres connus
+(\texttt{streamkm.demo.Main} et les tests de \texttt{CoresetSpec} en
+donnent déjà une validation qualitative --- écart maximal aux vrais centres
+de $0{,}014$ sur un mélange à 5 composantes, $n=200\,000$, cf.
+chapitre~\ref{ch:algorithmes}), à étendre systématiquement à $k \in
+\{5,10,20\}$ sur Covertype avant le rendu final.
+
+\aCompleter{table de coûts systématique pour $k \in \{5,10,20\}$ sur
+Covertype, écart en \% par rapport à un $k$-means++ batch de référence.}
+
+\subsection{E2 --- Trade-off taille de coreset $m$}
+
+Reproduit l'esprit des figures 5.1--5.2 de la thèse : à $k$ fixé, faire
+varier $m$ et observer le compromis coût/temps. Outil :
+\texttt{streamkm.experiments.QualityMetrics.runMSweep}, qui compare, pour
+chaque $m$, le coût de la référence séquentielle (\texttt{sequentialCost},
+un unique \texttt{BucketManager}, tout le flux d'un coup) et de
+l'implémentation distribuée (\texttt{distributedCost}, via
+\texttt{StreamKMPlusPlus.mergeCoresets}).
+
+\begin{quote}
+\textbf{Résultats préliminaires (test de fumée, à confirmer sur les 581\,012
+points complets).} Sur l'échantillon de 10\,000 points, $k=5$, comparaison
+$m=200$ vs $m=1\,000$ : coût de $1{,}0183 \times 10^{10}$ pour $m=200$
+contre $1{,}0085\times10^{10}$ pour $m=1\,000$ --- le coût diminue bien
+quand $m$ augmente, dans le sens attendu, mais sur un seul run et un tout
+petit sous-ensemble de la grille prévue par la spécification
+($m \in \{200,\allowbreak 1\,000,\allowbreak 2\,000,\allowbreak
+4\,000,\allowbreak 6\,000,\allowbreak 10\,000,\allowbreak 20\,000\}$,
+$k \in \{25,50,75\}$, 10 runs par point). Ce résultat confirme seulement
+que le protocole fonctionne de bout en bout, pas encore le compromis
+qualité/temps annoncé par la thèse.
+\end{quote}
+
+\aCompleter{grille complète $m \times k \times \text{runs}$ sur les 581\,012
+points, moyenne et écart-type par point, courbe coût vs $m$ (attendu : le
+coût plafonne au-delà de $m \approx 10\,000$) et temps vs $m$ (attendu :
+croissance linéaire) --- doit permettre de confirmer $m = 200k$ comme bon
+compromis (thèse, §2.3.4).}
+
+\subsection{E6 --- Comparaison de référence}
+\label{sec:eval-e6}
+
+À la place du code C original de la thèse (non disponible, §5.2.2), le
+groupe compare StreamKM++ à \texttt{spark.ml.KMeans} (batch, entraîné
+directement sur les données complètes, sans coreset) et à
+\texttt{StreamingKMeans} de MLlib. Les trois méthodes sont évaluées par la
+\textbf{même} fonction de coût (\texttt{CostEvaluator.cost}), condition
+nécessaire pour que la comparaison soit honnête --- le coût interne de
+chaque bibliothèque peut être défini différemment (par exemple, le
+\texttt{trainingCost} de \texttt{ml.KMeans} n'est pas garanti porter sur
+l'intégralité des données).
+
+\begin{quote}
+\textbf{Résultat préliminaire (test de fumée, 10\,000 points, $k=5$,
+$m=1\,000$).} StreamKM++ : $138$~ms, coût $\approx 1{,}008\times10^{10}$.
+\texttt{ml.KMeans} (batch) : $2\,673$~ms, coût $\approx 1{,}007\times10^{10}$
+--- coût quasi identique à StreamKM++, en un temps près de 20$\times$
+supérieur (attendu : un seul passage sur les données contre plusieurs
+itérations complètes de Lloyd sur l'ensemble). \texttt{StreamingKMeans} :
+$9\,827$~ms, coût $\approx 1{,}261\times10^{14}$ --- \textbf{quatre ordres
+de grandeur} pire que les deux autres méthodes. Cause probable, documentée
+dans le code (\texttt{E6Baseline}) : l'initialisation aléatoire de
+\texttt{StreamingKMeans} tire les centres suivant une loi normale centrée en
+0, sans rapport avec l'échelle réelle de Covertype (non standardisée,
+certaines colonnes atteignant $\sim 7\,000$), et le petit nombre de
+micro-batches simulés ne laisse pas le temps à l'algorithme de corriger un
+mauvais tirage initial. \textbf{Décision du groupe : ne pas corriger} cette
+initialisation --- le faire avantagerait cette seule méthode dans la
+comparaison. Si ce résultat se confirme sur les données complètes, c'est un
+argument concret pour la section « points forts/faibles »
+(chapitre~\ref{ch:discussion}) : StreamKM++ garantit une propriété de
+coreset, \texttt{StreamingKMeans} non, et y est sensible.
+\end{quote}
+
+\aCompleter{confirmer le résultat E6 ci-dessus sur les 581\,012 points
+complets, $k \in \{25,50,75\}$ --- un seul test de fumée sur 10\,000 points
+n'est pas une preuve.}
+
+\section{Scalabilité (E3, E3bis, E4, E5, E7)}
+\label{sec:eval-scalabilite}
+
+\aCompleter{\textbf{Section entière en cours de production par le groupe}
+(benchmarks JMH sur le kernel local + expérience Spark de scalabilité,
+branche de travail séparée). Structure prévue ci-dessous, à remplir avec
+les résultats une fois les runs terminés.}
+
+\subsection{Optimisation du kernel local (JMH)}
+
+Travail mené en parallèle sur les couches \texttt{core}/\texttt{coreset}
+uniquement (Structure of Arrays, tableaux primitifs, suppression du boxing
+--- cf. \texttt{streamkm.core.PointsSoA}), mesuré au JMH plutôt que dans un
+job Spark : le JMH mesure une JVM isolée, il ne peut rien dire d'un job
+distribué. Les deux mesures (kernel local puis job Spark de bout en bout)
+répondent à deux questions différentes.
+
+\aCompleter{table avant/après (ns/op) sur \texttt{sqdist}, \texttt{nearest},
+une itération de Lloyd, l'insertion \texttt{BucketManager}, et le pipeline
+complet --- issue de \texttt{results/jmh\_results.csv} --- accompagnée de
+la preuve que les tests fonctionnels (chapitre~\ref{ch:algorithmes}) passent
+toujours après l'optimisation.}
+
+\subsection{E3 --- Scalabilité forte}
+
+$k \in \{25,50,75,100\}$, c\oe{}urs $\in \{1,2,4,8\}$ (\texttt{local[N]}), 4 runs
+par point. Reprend les deux réglages de la thèse pour l'application finale
+de $k$-means++ (5 redémarrages vs 1 seul --- la thèse conclut que 1 seul
+suffit en pratique, §5.3.1).
+
+\aCompleter{courbes temps/speedup/efficacité vs nombre de c\oe{}urs, moyenne et
+écart-type sur 4 runs (reproduit fig.~5.8 de la thèse).}
+
+\subsection{E3bis --- Partitions à c\oe{}urs constants}
+
+C\oe{}urs fixés à 4, partitions $\in \{4,8,16,32\}$, coût mesuré. Expérience
+propre au groupe (§\ref{sec:spark-partitions-coeurs}), rendue possible par
+le découplage partitions/c\oe{}urs de Spark, que le modèle de parallélisme de
+Flink ne permet pas de tester directement.
+
+\aCompleter{coût vs nombre de partitions à c\oe{}urs fixes --- si le coût
+diminue quand les partitions augmentent, l'explication de la thèse pour la
+figure~5.9 (plus de partitions = plus de listes de buckets = coreset plus
+fin) est confirmée.}
+
+\subsection{E4 --- Scalabilité faible}
+
+Données $\times N$ et c\oe{}urs $\times N$ simultanément ; un temps constant
+serait le signe d'une bonne scalabilité faible.
+
+\aCompleter{courbe temps vs $N$ à charge par c\oe{}ur constante.}
+
+\subsection{E5 --- Débit}
+
+Covertype répliqué $\times\{1,2,4,8\}$, débit mesuré en points/s. Attendu :
+le débit \emph{augmente} avec la taille des données, parce que la partie
+non parallèle ($k$-means++ final, sur le driver) est à temps constant et
+s'amortit sur un plus grand nombre de points.
+
+\aCompleter{courbe débit vs taille des données (reproduit fig.~5.16--5.19
+de la thèse).}
+
+\subsection{E7 --- Fusion séquentielle vs arborescente}
+
+L'expérience qui justifie directement notre apport principal
+(chapitre~\ref{ch:implementation}, §\ref{sec:impl-dataflow}) : notre
+\texttt{treeReduce} contre une fusion strictement séquentielle (parallélisme
+1, comme l'opérateur \texttt{FlatMapToFinalCoreset} de la thèse), à
+parallélisme croissant.
+
+\aCompleter{comparaison temps/coût, fusion séquentielle vs \texttt{treeReduce},
+à parallélisme croissant --- doit montrer que le plafond de speedup observé
+par la thèse au-delà de 8 c\oe{}urs (§5.3.1) recule. Si l'expérience ne montre
+rien, le dire explicitement : c'est aussi un résultat.}
+
+\subsection{Hygiène de mesure}
+
+Premier run de chaque JVM écarté (échauffement JIT), 4 runs suivants
+conservés. Graines fixées et reportées, une par partition
+(§\ref{sec:impl-dataflow}), pour la reproductibilité. Moyenne \emph{et}
+écart-type systématiquement reportés --- une courbe de speedup sans
+dispersion ne prouve rien. Temps de lecture I/O et temps de calcul séparés,
+pour ne pas mesurer accidentellement le disque plutôt que l'algorithme.

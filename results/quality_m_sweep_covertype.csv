@@ -1,0 +1,9 @@
+dataset,method,k,m,run,seed,cost
+Covertype,Sequential StreamKM++,25,1000,1,2026,5.061028037883913E9
+Covertype,Spark StreamKM++,25,1000,1,2026,5.0209212165112705E9
+Covertype,Sequential StreamKM++,25,5000,1,2026,4.958002891450664E9
+Covertype,Spark StreamKM++,25,5000,1,2026,4.873754135162273E9
+Covertype,Sequential StreamKM++,25,10000,1,2026,4.846914723317061E9
+Covertype,Spark StreamKM++,25,10000,1,2026,4.829828110209726E9
+Covertype,Sequential StreamKM++,25,20000,1,2026,4.966648309261143E9
+Covertype,Spark StreamKM++,25,20000,1,2026,4.873239351409222E9

@@ -4,6 +4,7 @@ import java.io.{File, FileOutputStream, OutputStreamWriter, PrintWriter}
 import java.nio.charset.StandardCharsets
 
 import scala.io.Source
+import scala.util.Try
 
 import org.apache.spark.ml.clustering.{KMeans => MLKMeans}
 import org.apache.spark.ml.linalg.{SQLDataTypes, Vectors}
@@ -16,220 +17,537 @@ import streamkm.coreset.BucketManager
 import streamkm.spark.{CostEvaluator, StreamKMParams, StreamKMPlusPlus}
 
 /**
- * Harnais d'expériences de QUALITÉ du clustering (coût SSE), en miroir de la thèse
- * §5.2 (Bitsakis 2018, "Non-Parallel Experiments" / "Comparison with original
- * StreamKM++"). Mesure UNIQUEMENT le coût — PAS le temps d'exécution, couvert
- * séparément par les benchmarks JMH (E6).
+ * Experiments de qualite pour StreamKM++ sur le dataset Covertype.
  *
- * Objet séparé de la production (SPEC §1, règle d'or) : ne modifie et ne duplique
- * aucune logique de `streamkm.core`, `streamkm.coreset` ou `streamkm.spark`. Toute
- * la logique de coût vient de `KMeans.cost` / `CostEvaluator.cost`, tout le calcul
- * du coreset vient de `BucketManager` / `StreamKMPlusPlus.mergeCoresets`.
+ * Trois approches sont comparees :
+ *   1. StreamKM++ sequentiel ;
+ *   2. StreamKM++ distribue avec Spark ;
+ *   3. K-Means de Spark MLlib utilise comme reference externe.
  *
- * Sortie : CSV écrits localement (pas via `df.write.csv`, qui produirait un
- * répertoire de part-files plutôt qu'un fichier unique) — voir CLAUDE.md pour la
- * justification de ce choix et l'absence volontaire de génération de graphes ici.
+ * La mesure de qualite est la SSE :
+ *   sum_x min_c ||x - c||^2
+ *
+ * Les couts sont toujours evalues sur les donnees originales,
+ * et non uniquement sur le coreset.
  */
 object QualityMetrics {
 
-  /** Une ligne de résultat brut : un (dataset, méthode, k, m) → coût. */
-  final case class ResultRow(dataset: String, method: String, k: Int, m: Int, cost: Double)
+  private val Dim = 54
+  private val DefaultSeed = 2026L
+  private val DefaultPartitions = 8
 
-  // ======================================================================
-  // Chargement des données
-  // ======================================================================
+  private val NRestarts = 5
+  private val MaxIter = 100
+  private val Tol = 1e-6
+
+  private val KValues = Seq(10, 20, 30, 40, 50)
+
+  // Valeurs coherentes avec l'experience Covertype de la these.
+  private val MValues = Seq(1000, 5000, 10000, 20000)
+
+  final case class ResultRow(
+    dataset: String,
+    method: String,
+    k: Int,
+    m: Int,
+    run: Int,
+    seed: Long,
+    cost: Double
+  )
+
+  // ---------------------------------------------------------------------------
+  // Chargement de Covertype
+  // ---------------------------------------------------------------------------
 
   /**
-   * Charge un fichier Covertype (UCI ML Repository — même source que la thèse,
-   * §5.2, table 5.2 : "581,012 points in 54 dimensions"). Le fichier brut a 55
-   * colonnes (54 attributs + 1 label de classe à la fin) ; on ne garde que les 54
-   * premières.
+   * Charge Covertype.
    *
-   * Réutilise `Point.parse` (couche core, déjà testé par `KMeansSpec`) plutôt que
-   * de redévelopper une validation numérique : on tronque juste chaque ligne aux
-   * `dim` premières colonnes avant de la lui passer.
+   * Le fichier contient 55 colonnes :
+   *   - 54 attributs ;
+   *   - 1 label de classe.
    *
-   * `maxPoints` permet de charger un sous-échantillon — utilisé pour un test de
-   * fumée rapide avant de lancer le protocole complet sur les 581k points.
+   * Le label n'est pas utilise pour le clustering.
+   *
+   * maxPoints permet de limiter le nombre de lignes pour les tests rapides.
    */
-  def loadCovertype(path: String, dim: Int = 54, maxPoints: Option[Int] = None): Array[Point] = {
-    val src = Source.fromFile(path)
+  def loadCovertype(
+    path: String,
+    dim: Int = Dim,
+    maxPoints: Option[Int] = None
+  ): Array[Point] = {
+
+    val source = Source.fromFile(path)
+
     try {
       val lines = maxPoints match {
-        case Some(n) => src.getLines().take(n)
-        case None    => src.getLines()
+        case Some(n) => source.getLines().take(n)
+        case None    => source.getLines()
       }
+
       lines.flatMap { line =>
-        val cols = line.trim.split(",")
-        if (cols.length < dim) None
-        else Point.parse(cols.take(dim).mkString(","), dim, ',')
+        val columns = line.trim.split(",")
+
+        if (columns.length < dim) {
+          None
+        } else {
+          Point.parse(columns.take(dim).mkString(","), dim)
+        }
       }.toArray
-    } finally src.close()
+
+    } finally {
+      source.close()
+    }
   }
 
-  // ======================================================================
-  // Les trois méthodes comparées — aucune logique de coût réimplémentée ici
-  // ======================================================================
+  // ---------------------------------------------------------------------------
+  // StreamKM++ sequentiel
+  // ---------------------------------------------------------------------------
 
   /**
-   * Référence séquentielle (E2 / `demo.Main`) : un seul `BucketManager`, tout le
-   * flux d'un coup, sur un seul thread. C'est la "vérité de référence" à laquelle
-   * on compare la version distribuée (miroir des figures 5.3-5.7 de la thèse).
+   * Execute StreamKM++ sur un seul thread.
+   *
+   * Le clustering est construit sur le coreset, puis le cout final est
+   * calcule sur toutes les donnees originales.
    */
-  def sequentialCost(points: Array[Point], k: Int, m: Int, seed: Long): Double = {
-    val bm = new BucketManager(m, seed)
-    bm.insertAll(points)
-    val model = KMeans.fit(bm.extractCoreset(), k, nRestarts = 5, seed = seed)
+  def sequentialCost(
+    points: Array[Point],
+    k: Int,
+    m: Int,
+    seed: Long
+  ): Double = {
+
+    val manager = new BucketManager(m, seed)
+    manager.insertAll(points)
+
+    val coreset = manager.extractCoreset()
+
+    val model = KMeans.fit(
+      coreset,
+      k,
+      nRestarts = NRestarts,
+      maxIter = MaxIter,
+      tol = Tol,
+      seed = seed
+    )
+
     KMeans.cost(points, model.centers)
   }
 
+  // ---------------------------------------------------------------------------
+  // StreamKM++ Spark
+  // ---------------------------------------------------------------------------
+
   /**
-   * Notre implémentation distribuée : `mergeCoresets` (E4) pour construire le
-   * coreset, `KMeans.fit` (E1) pour le clustering, puis `CostEvaluator.cost` (E5,
-   * réutilisé tel quel — pas de recalcul du coût "à la main") pour évaluer le
-   * résultat sur l'ensemble des données, en parallèle.
+   * Execute la version distribuee de StreamKM++.
    */
-  def distributedCost(rdd: RDD[Point], k: Int, m: Int, seed: Long, numPartitions: Int): Double = {
-    // Partitions toujours fixées explicitement (METHODO §4.0), jamais laissées à
-    // Spark — condition nécessaire pour que les futures expériences de
-    // scalabilité isolent bien l'effet du partitionnement.
-    val partitioned = rdd.repartition(numPartitions)
-    val coreset = StreamKMPlusPlus.mergeCoresets(partitioned, StreamKMParams(k = k, m = m, seed = seed))
-    val model   = KMeans.fit(coreset, k, nRestarts = 5, seed = seed)
+  def distributedCost(
+    rdd: RDD[Point],
+    k: Int,
+    m: Int,
+    seed: Long,
+    numPartitions: Int
+  ): Double = {
+
+    // Evite un shuffle inutile si le RDD possede deja
+    // le nombre de partitions souhaite.
+    val partitioned =
+      if (rdd.getNumPartitions == numPartitions) rdd
+      else rdd.repartition(numPartitions)
+
+    val params = StreamKMParams(
+      k = k,
+      m = m,
+      nRestarts = NRestarts,
+      seed = seed
+    )
+
+    val coreset =
+      StreamKMPlusPlus.mergeCoresets(partitioned, params)
+
+    val model = KMeans.fit(
+      coreset,
+      k,
+      nRestarts = NRestarts,
+      maxIter = MaxIter,
+      tol = Tol,
+      seed = seed
+    )
+
     CostEvaluator.cost(partitioned, model.centers)
   }
 
-  /**
-   * Référence EXTERNE : Spark MLlib `KMeans`, entraîné directement sur le dataset
-   * complet (pas sur un coreset — c'est tout l'intérêt de la comparaison : montrer
-   * ce que coûte, ou ce que fait gagner, le passage par un coreset). Le DataFrame
-   * est construit explicitement via un schéma (`SQLDataTypes.VectorType`) plutôt
-   * que via `Seq(...).toDF()`, pour garder le contrôle du nombre de partitions —
-   * même exigence que pour `distributedCost`.
-   */
-  def mllibCost(spark: SparkSession, points: Array[Point], k: Int, seed: Long, numPartitions: Int): Double = {
-    val schema = StructType(Seq(StructField("features", SQLDataTypes.VectorType, nullable = false)))
-    val rowRdd = spark.sparkContext
-      .parallelize(points, numPartitions)
-      .map(p => SqlRow(Vectors.dense(p.coords)))
-    val df = spark.createDataFrame(rowRdd, schema)
+  // ---------------------------------------------------------------------------
+  // Spark MLlib
+  // ---------------------------------------------------------------------------
 
-    val model = new MLKMeans().setK(k).setSeed(seed).setFeaturesCol("features").fit(df)
-    model.summary.trainingCost // WSSSE — même définition que KMeans.cost (SSE non pondérée)
+  /**
+   * Reference externe utilisant Spark MLlib.
+   *
+   * Pour rendre la comparaison plus equitable, MLlib utilise :
+   *   - le meme nombre de redemarrages ;
+   *   - le meme maximum d'iterations ;
+   *   - la meme tolerance.
+   *
+   * On conserve le meilleur cout parmi les redemarrages.
+   */
+  def mllibCost(
+    spark: SparkSession,
+    points: Array[Point],
+    k: Int,
+    seed: Long,
+    numPartitions: Int
+  ): Double = {
+
+    val schema = StructType(
+      Seq(
+        StructField(
+          "features",
+          SQLDataTypes.VectorType,
+          nullable = false
+        )
+      )
+    )
+
+    val rows = spark.sparkContext
+      .parallelize(points, numPartitions)
+      .map(point => SqlRow(Vectors.dense(point.coords)))
+
+    val df = spark.createDataFrame(rows, schema).cache()
+
+    try {
+      (0 until NRestarts).map { restart =>
+
+        val model = new MLKMeans()
+          .setK(k)
+          .setSeed(seed + restart)
+          .setFeaturesCol("features")
+          .setMaxIter(MaxIter)
+          .setTol(Tol)
+          .fit(df)
+
+        model.summary.trainingCost
+
+      }.min
+
+    } finally {
+      df.unpersist()
+    }
   }
 
-  // ======================================================================
-  // Expérience 1+2 : non-régression (vs séquentiel) + comparaison MLlib, à k variable
-  // Miroir des figures 5.3-5.7 de la thèse (un graphique par dataset, une barre par méthode).
-  // ======================================================================
+  // ---------------------------------------------------------------------------
+  // Experience 1 : variation de k
+  // ---------------------------------------------------------------------------
 
   def runKSweep(
-    spark:         SparkSession,
-    datasetName:   String,
-    points:        Array[Point],
-    ks:            Seq[Int],
+    spark: SparkSession,
+    datasetName: String,
+    points: Array[Point],
+    ks: Seq[Int],
     numPartitions: Int,
-    seed:          Long
+    baseSeed: Long,
+    nRepeats: Int = 1
   ): Seq[ResultRow] = {
-    val rdd = spark.sparkContext.parallelize(points, numPartitions)
-    ks.flatMap { k =>
-      val m = BucketManager.recommendedM(k) // 200·k, convention du projet (thèse §2.3.4)
-      println(s"[QualityMetrics] k-sweep : k=$k, m=$m ...")
 
-      val seq  = sequentialCost(points, k, m, seed)
-      val dist = distributedCost(rdd, k, m, seed, numPartitions)
-      val mll  = mllibCost(spark, points, k, seed, numPartitions)
+    val rdd =
+      spark.sparkContext.parallelize(points, numPartitions).cache()
 
-      Seq(
-        ResultRow(datasetName, "Séquentiel (E2)",                       k, m, seq),
-        ResultRow(datasetName, "Spark distribué (notre implémentation)", k, m, dist),
-        ResultRow(datasetName, "MLlib KMeans (batch, sans coreset)",     k, m, mll)
-      )
+    try {
+      ks.flatMap { k =>
+
+        val m = BucketManager.recommendedM(k)
+
+        (1 to nRepeats).flatMap { run =>
+
+          val seed = baseSeed + run - 1
+
+          println(
+            s"[QualityMetrics] k-sweep: " +
+              s"k=$k m=$m run=$run/$nRepeats seed=$seed"
+          )
+
+          val sequential =
+            sequentialCost(points, k, m, seed)
+
+          val distributed =
+            distributedCost(rdd, k, m, seed, numPartitions)
+
+          val mllib =
+            mllibCost(spark, points, k, seed, numPartitions)
+
+          Seq(
+            ResultRow(
+              datasetName,
+              "Sequential StreamKM++",
+              k,
+              m,
+              run,
+              seed,
+              sequential
+            ),
+            ResultRow(
+              datasetName,
+              "Spark StreamKM++",
+              k,
+              m,
+              run,
+              seed,
+              distributed
+            ),
+            ResultRow(
+              datasetName,
+              "Spark MLlib KMeans",
+              k,
+              m,
+              run,
+              seed,
+              mllib
+            )
+          )
+        }
+      }
+
+    } finally {
+      rdd.unpersist()
     }
   }
 
-  // ======================================================================
-  // Expérience 3 : trade-off qualité vs taille de coreset m, à k fixe
-  // Miroir de l'esprit des figures 5.1-5.2 de la thèse (axe coût uniquement —
-  // l'axe temps est couvert par les benchmarks JMH d'un autre membre du groupe).
-  // ======================================================================
+  // ---------------------------------------------------------------------------
+  // Experience 2 : variation de la taille du coreset
+  // ---------------------------------------------------------------------------
 
   def runMSweep(
-    spark:         SparkSession,
-    datasetName:   String,
-    points:        Array[Point],
-    k:             Int,
-    ms:            Seq[Int],
+    spark: SparkSession,
+    datasetName: String,
+    points: Array[Point],
+    k: Int,
+    ms: Seq[Int],
     numPartitions: Int,
-    seed:          Long
+    baseSeed: Long,
+    nRepeats: Int = 1
   ): Seq[ResultRow] = {
-    val rdd = spark.sparkContext.parallelize(points, numPartitions)
-    ms.flatMap { m =>
-      println(s"[QualityMetrics] m-sweep : m=$m (k=$k) ...")
-      val seq  = sequentialCost(points, k, m, seed)
-      val dist = distributedCost(rdd, k, m, seed, numPartitions)
-      Seq(
-        ResultRow(datasetName, "Séquentiel (E2)",                       k, m, seq),
-        ResultRow(datasetName, "Spark distribué (notre implémentation)", k, m, dist)
-      )
+
+    val rdd =
+      spark.sparkContext.parallelize(points, numPartitions).cache()
+
+    try {
+      ms.flatMap { m =>
+
+        (1 to nRepeats).flatMap { run =>
+
+          val seed = baseSeed + run - 1
+
+          println(
+            s"[QualityMetrics] m-sweep: " +
+              s"k=$k m=$m run=$run/$nRepeats seed=$seed"
+          )
+
+          val sequential =
+            sequentialCost(points, k, m, seed)
+
+          val distributed =
+            distributedCost(rdd, k, m, seed, numPartitions)
+
+          Seq(
+            ResultRow(
+              datasetName,
+              "Sequential StreamKM++",
+              k,
+              m,
+              run,
+              seed,
+              sequential
+            ),
+            ResultRow(
+              datasetName,
+              "Spark StreamKM++",
+              k,
+              m,
+              run,
+              seed,
+              distributed
+            )
+          )
+        }
+      }
+
+    } finally {
+      rdd.unpersist()
     }
   }
 
-  // ======================================================================
-  // Écriture CSV
-  // ======================================================================
+  // ---------------------------------------------------------------------------
+  // CSV
+  // ---------------------------------------------------------------------------
 
-  def writeCsv(path: String, rows: Seq[ResultRow]): Unit = {
-    val file = new File(path)
-    Option(file.getParentFile).foreach(_.mkdirs())
-    // UTF-8 explicite : PrintWriter(File) utilise sinon l'encodage par défaut de la
-    // plateforme (Cp1252 sous Windows), qui corrompt les accents ("Séquentiel" devient
-    // "S?quentiel"). Constaté sur le test de fumée du 2026-08-22.
-    val pw = new PrintWriter(new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))
-    try {
-      pw.println("dataset,method,k,m,cost")
-      rows.foreach(r => pw.println(s"${r.dataset},${r.method},${r.k},${r.m},${r.cost}"))
-    } finally pw.close()
+  private def csvField(value: String): String = {
+    if (
+      value.exists(c =>
+        c == ',' || c == '"' || c == '\n' || c == '\r'
+      )
+    ) {
+      "\"" + value.replace("\"", "\"\"") + "\""
+    } else {
+      value
+    }
   }
 
-  // ======================================================================
-  // Point d'entrée
-  // ======================================================================
+  def writeCsv(
+    path: String,
+    rows: Seq[ResultRow]
+  ): Unit = {
+
+    val file = new File(path)
+
+    Option(file.getParentFile).foreach(_.mkdirs())
+
+    val writer = new PrintWriter(
+      new OutputStreamWriter(
+        new FileOutputStream(file),
+        StandardCharsets.UTF_8
+      )
+    )
+
+    try {
+      writer.println(
+        "dataset,method,k,m,run,seed,cost"
+      )
+
+      rows.foreach { row =>
+        writer.println(
+          Seq(
+            csvField(row.dataset),
+            csvField(row.method),
+            row.k.toString,
+            row.m.toString,
+            row.run.toString,
+            row.seed.toString,
+            row.cost.toString
+          ).mkString(",")
+        )
+      }
+
+    } finally {
+      writer.close()
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Main
+  // ---------------------------------------------------------------------------
+
+  private def positiveInt(
+    args: Array[String],
+    index: Int
+  ): Option[Int] = {
+    args
+      .lift(index)
+      .flatMap(value => Try(value.toInt).toOption)
+      .filter(_ > 0)
+  }
 
   /**
-   * Usage : `sbt "runMain streamkm.experiments.QualityMetrics [chemin] [maxPoints]"`
-   *   - `chemin`    : fichier Covertype (défaut : data/covertype/covtype.data)
-   *   - `maxPoints` : sous-échantillon pour un test rapide (défaut : tout charger)
+   * Usage :
+   *
+   * sbt "runMain streamkm.experiments.QualityMetrics \
+   * data/covertype/covtype.data 20000 1"
+   *
+   * args(0) : chemin du dataset
+   * args(1) : nombre maximal de points
+   * args(2) : nombre de repetitions
    */
   def main(args: Array[String]): Unit = {
-    val path          = if (args.length > 0) args(0) else "data/covertype/covtype.data"
-    val maxPoints     = if (args.length > 1 && args(1).toInt > 0) Some(args(1).toInt) else None
-    val seed          = 2026L
-    val numPartitions = 8
 
-    val spark = SparkSession.builder()
-      .appName("QualityMetrics")
+    val path =
+      args.headOption.getOrElse(
+        "data/covertype/covtype.data"
+      )
+
+    val maxPoints =
+      positiveInt(args, 1)
+
+    val nRepeats =
+      positiveInt(args, 2).getOrElse(1)
+
+    val spark = SparkSession
+      .builder()
+      .appName("StreamKM++ Quality Experiments")
       .master("local[*]")
       .config("spark.ui.enabled", "false")
       .getOrCreate()
 
+    spark.sparkContext.setLogLevel("WARN")
+
     try {
-      println(s"[QualityMetrics] chargement de $path (maxPoints=$maxPoints)...")
-      val points = loadCovertype(path, dim = 54, maxPoints = maxPoints)
-      println(s"[QualityMetrics] ${points.length} points chargés.")
+      println(
+        s"[QualityMetrics] Loading $path " +
+          s"(maxPoints=$maxPoints)"
+      )
 
-      // k = [10,20,30,40,50] : reproduit exactement la grille de la thèse pour
-      // Covertype (§5.2.2, figure 5.5).
-      val kSweepRows = runKSweep(spark, "Covertype", points, Seq(10, 20, 30, 40, 50), numPartitions, seed)
-      writeCsv("results/quality_k_sweep_covertype.csv", kSweepRows)
+      val points =
+        loadCovertype(
+          path,
+          dim = Dim,
+          maxPoints = maxPoints
+        )
 
-      // k=25 fixe (comme la courbe médiane de la thèse fig. 5.1), m variable.
-      val mSweepRows = runMSweep(spark, "Covertype", points, k = 25, Seq(1000, 5000, 10000, 20000, 50000), numPartitions, seed)
-      writeCsv("results/quality_m_sweep_covertype.csv", mSweepRows)
+      require(
+        points.nonEmpty,
+        s"No valid point loaded from $path"
+      )
 
-      println("[QualityMetrics] terminé.")
-      println("  -> results/quality_k_sweep_covertype.csv")
-      println("  -> results/quality_m_sweep_covertype.csv")
+      println(
+        s"[QualityMetrics] ${points.length} points loaded."
+      )
+
+      // ------------------------------------------------------------
+      // k-sweep
+      // ------------------------------------------------------------
+
+      val kSweepRows =
+        runKSweep(
+          spark = spark,
+          datasetName = "Covertype",
+          points = points,
+          ks = KValues,
+          numPartitions = DefaultPartitions,
+          baseSeed = DefaultSeed,
+          nRepeats = nRepeats
+        )
+
+      writeCsv(
+        "results/quality_k_sweep_covertype.csv",
+        kSweepRows
+      )
+
+      // ------------------------------------------------------------
+      // m-sweep
+      // ------------------------------------------------------------
+
+      val mSweepRows =
+        runMSweep(
+          spark = spark,
+          datasetName = "Covertype",
+          points = points,
+          k = 25,
+          ms = MValues,
+          numPartitions = DefaultPartitions,
+          baseSeed = DefaultSeed,
+          nRepeats = nRepeats
+        )
+
+      writeCsv(
+        "results/quality_m_sweep_covertype.csv",
+        mSweepRows
+      )
+
+      println("[QualityMetrics] Done.")
+      println(
+        "  -> results/quality_k_sweep_covertype.csv"
+      )
+      println(
+        "  -> results/quality_m_sweep_covertype.csv"
+      )
+
     } finally {
       spark.stop()
     }

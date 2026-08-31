@@ -14,8 +14,11 @@ import streamkm.core.{Distance, Point, Sampling}
  * Mais elle appelle aussi « weight » le poids des points du coreset produit, qui vaut le
  * NOMBRE (la masse) de points représentés. Ce sont deux quantités totalement différentes
  * portant le même nom. On les sépare explicitement :
- *   - `cost` : Σ_{p ∈ P_v} w_p · ‖p − q_v‖²   → sert à la descente (étape 1 du §2.3.3)
- *   - `mass` : Σ_{p ∈ P_v} w_p                → sert au poids du point de coreset en sortie
+ *   - `cost` : sum_{p in P_v} w_p * ||p - q_v||^2
+*              sert a la descente
+*
+*   - `mass` : sum_{p in P_v} w_p
+*              sert au poids du point de coreset en sortie
  *
  * @param points feuille : les points du cluster. Nœud interne : null.
  * @param repr   point représentatif q_v (stocké aussi sur les nœuds internes, il devient
@@ -96,7 +99,7 @@ object CoresetTree {
   /**
    * Étape 1 : choisir une feuille avec une probabilité proportionnelle à son coût.
    *
-   * ⚠️ AMBIGUÏTÉ DE LA SOURCE, tranchée ici et à signaler dans le rapport.
+   * 
    * Le §2.3.3 étape 1 dit « with a probability proportional to cost(P_ℓ, q_ℓ) », et détaille
    * une descente où un fils est choisi avec probabilité cost(fils)/cost(père). La ligne 5 de
    * l'algorithme 2.4 dit en revanche « according to their weights ». Les deux formulations

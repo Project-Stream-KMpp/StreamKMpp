@@ -208,7 +208,7 @@ object KMeans {
   }
 
   /**
-   * Fonction objectif : SSE pondérée, Σ_p w_p · min_c ‖p − c‖².
+   * Fonction objectif : SSE ponderee, sum_p w_p * min_c ||p - c||^2.
    * C'est la mesure de qualité unique de tout le projet (thèse §4.2) : tous les
    * chapitres expérimentaux comparent des valeurs produites par cette fonction.
    */
